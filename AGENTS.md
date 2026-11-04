@@ -1,12 +1,15 @@
 # AGENTS.md
 
 - What lives here: shared libraries that are not base plumbing (integrations with the outside: mcpserver, llmwire,
-  webfetch; Apple Music once reworm's and loom's copies drift). Base functionality goes to ship's kit; a library for
+  webfetch, applemusic). Base functionality goes to ship's kit; a library for
   one app stays in that app. User: kit "is more about common base functionality"; a repo per library "is totally
   overblown". llmwire and webfetch were own repos (archived after the move); their rules are their dir's AGENTS.md.
 - One module, one version line, a package per library. No nested go.mod: every new module costs release wiring.
   A library's dependencies land in every consumer's module graph (go.sum lines, not builds): keep them few, pure Go.
 - Consumers are the trick77 apps; a v0.x minor may break them. Breaking change = minor, say so in the release note.
+- applemusic: one Client, two policies. loom's tunewire answers a user (Tries 1, RateLimitWait 5 s); reworm's import
+  is a batch (Tries 4, no 429 wait: Apple's 429 window lasted ~3.5 h on 2026-11-04, retrying only prolongs it).
+  Keep both callers' behavior when changing get.
 - mcpserver: protocol only. App concepts stay in the app (loom's X-Loom-User is loom's `internal/loomuser`, named via
   `Server.UserHeader`; peeq's channel hint rides `InstructionsFunc`/`DescriptionFunc`).
 
