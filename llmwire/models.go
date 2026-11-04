@@ -1,0 +1,256 @@
+package llmwire
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"net/http"
+	"net/url"
+)
+
+// The models listing.
+//
+// GET {base}/models is the one read-only route this package speaks. Behind a
+// gateway it does two jobs the completions route cannot: it says which models
+// THIS key may use (LiteLLM lists exactly the key's own set), and it carries the
+// gateway's per-deployment limits, which the chat response never does. A service
+// that wants to size its prompts to a gateway-capped window reads it once at
+// boot.
+
+// routeModels is the listing route, appended to the configured base URL.
+const routeModels = "/models"
+
+// ModelEntry is one row of the listing.
+//
+// Only the id is promised by the OpenAI shape. The limits are LiteLLM
+// extensions (`max_input_tokens`, `max_output_tokens`) and are nil when the
+// entry does not carry them; a caller that needs one has to say so itself. Raw
+// keeps the whole object for fields this package does not model.
+type ModelEntry struct {
+	ID string
+	// MaxInputTokens is the gateway's context window for this alias. A gateway
+	// may cap below the vendor's own limit, so this is the figure to size
+	// prompts against, not the profile's.
+	MaxInputTokens *int64
+	// MaxOutputTokens is the gateway's completion cap for this alias.
+	MaxOutputTokens *int64
+	Raw             json.RawMessage
+}
+
+// wireModelEntry mirrors one listing row. Decoded leniently: an entry from a
+// gateway carries dozens of fields nobody has modelled, and the two limits are
+// read as raw JSON because they arrive in more than one shape (see limitField).
+type wireModelEntry struct {
+	ID              json.RawMessage `json:"id"`
+	MaxInputTokens  json.RawMessage `json:"max_input_tokens"`
+	MaxOutputTokens json.RawMessage `json:"max_output_tokens"`
+	// MaxTokens is Anthropic's spelling of the output cap on its listing,
+	// read only where max_output_tokens is absent.
+	MaxTokens json.RawMessage `json:"max_tokens"`
+}
+
+// ListModels fetches the listing behind the client's base URL and key.
+//
+// The three returns follow Chat: an entry whose limit is present but unusable
+// (a bool, a string, a fraction, zero) keeps a nil limit and adds a Warning
+// naming it, rather than failing the whole listing over one row the caller may
+// never look at. Only the listing's own shape is an error: `data` must be a
+// list. A bad status is the same typed error a completion would return.
+//
+// Bounded by the caller's context and, per page, the whole-call cap, like
+// every other exchange; a paged listing starts no page once it has spent the
+// cap, so it can run to just under twice it. A listing is quick, so a caller
+// wanting a tighter bound for a boot check passes a context with one.
+func (c *Client) ListModels(ctx context.Context) ([]ModelEntry, []Warning, error) {
+	if c.routes != nil {
+		return nil, nil, c.errSeveralHosts("ListModels")
+	}
+	var (
+		entries  []ModelEntry
+		warnings []Warning
+		timing   Timing
+		pages    int
+	)
+	failed := func(err error) ([]ModelEntry, []Warning, error) {
+		c.log.Warn("llmwire models listing failed", "error", Truncate(c.redact(err.Error()), maxLoggedError),
+			"pages", pages, "headers_ms", timing.Headers.Milliseconds(), "total_ms", timing.Total.Milliseconds())
+		return nil, nil, err
+	}
+	// Anthropic's listing is paged (has_more, last_id; 20 rows unless asked).
+	// Followed only when the first page says so, so the OpenAI-shaped listings,
+	// which send neither, see the one plain GET they always did. Each page has
+	// the call cap, as every exchange does; no page starts once the listing has
+	// spent it. A cursor is followed once, and a row whose id an earlier page
+	// carried is not added again, so a server that ignores after_id, or
+	// cycles, adds nothing twice. (An alias split over a page boundary loses
+	// its second row; Anthropic, the one paged listing, has one row per id.)
+	start := c.now()
+	seenID, seenCursor := map[string]bool{}, map[string]bool{}
+	for route := routeModels; route != ""; {
+		raw, _, t, err := c.rawCall(ctx, http.MethodGet, route, nil)
+		pages++
+		timing.Headers += t.Headers
+		timing.Total += t.Total
+		if err != nil {
+			return failed(err)
+		}
+		page, w, more, next, err := parseModelsPage(c.redact, raw)
+		if err != nil {
+			return failed(err)
+		}
+		warnings = append(warnings, w...)
+		// Across pages only: two rows for one id on ONE page are the server's
+		// (a gateway alias over two deployments) and are both kept.
+		for _, e := range page {
+			if !seenID[e.ID] {
+				entries = append(entries, e)
+			}
+		}
+		for _, e := range page {
+			seenID[e.ID] = true
+		}
+		route = ""
+		cut := func(why string) {
+			warnings = append(warnings, Warning{Kind: WarnOther, Feature: "models",
+				Details: fmt.Sprintf("the listing says it has more pages, but %s; only %d entries were read", why, len(entries))})
+		}
+		switch {
+		case !more:
+		case next == "":
+			cut("names no id to continue after")
+		case seenCursor[next]:
+			cut("came back to " + next)
+		case pages == maxModelPages:
+			cut(fmt.Sprintf("this package reads %d at most", maxModelPages))
+		case c.now().Sub(start) >= c.cap:
+			cut(fmt.Sprintf("the listing has spent the %s call cap", c.cap))
+		default:
+			seenCursor[next] = true
+			route = routeModels + "?limit=1000&after_id=" + url.QueryEscape(next)
+		}
+	}
+	// Not a model call: it goes through no plan, carries no usage and would
+	// only pollute the per-model stats, so it reports on its own line rather
+	// than through finish.
+	c.log.Debug("llmwire models listed", "models", len(entries), "warnings", len(warnings), "pages", pages,
+		"headers_ms", timing.Headers.Milliseconds(), "total_ms", timing.Total.Milliseconds())
+	return entries, warnings, nil
+}
+
+// maxModelPages bounds a paged listing: a server that answers has_more
+// forever must not hold a boot check for good.
+const maxModelPages = 20
+
+// parseModelsPage decodes one page of the listing, whether it says there is
+// more, and the id to continue after: its last_id, or its last row's id.
+func parseModelsPage(redact redactor, raw json.RawMessage) (_ []ModelEntry, _ []Warning, more bool, next string, _ error) {
+	var w struct {
+		Data    json.RawMessage `json:"data"`
+		Error   json.RawMessage `json:"error"`
+		HasMore bool            `json:"has_more"`
+		LastID  string          `json:"last_id"`
+	}
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return nil, nil, false, "", fmt.Errorf("llmwire: %w: decoding models listing: %w (body: %s)",
+			ErrMalformedResponse, err, bodySnippet(redact, raw))
+	}
+	if len(w.Error) > 0 && !isJSONNull(w.Error) {
+		return nil, nil, false, "", parseAPIErrorWith(redact, 0, raw)
+	}
+	var rows []json.RawMessage
+	if len(w.Data) == 0 || isJSONNull(w.Data) {
+		return nil, nil, false, "", fmt.Errorf("llmwire: %w: models listing carries no data list (body: %s)",
+			ErrResponseShape, bodySnippet(redact, raw))
+	}
+	if err := json.Unmarshal(w.Data, &rows); err != nil {
+		return nil, nil, false, "", fmt.Errorf("llmwire: %w: models listing data is not a list (body: %s)",
+			ErrResponseShape, bodySnippet(redact, raw))
+	}
+	entries, warnings := parseModelRows(rows)
+	if w.HasMore {
+		next = w.LastID
+		if next == "" && len(entries) > 0 {
+			next = entries[len(entries)-1].ID
+		}
+	}
+	return entries, warnings, w.HasMore, next, nil
+}
+
+// parseModelRows decodes the rows of one page.
+func parseModelRows(rows []json.RawMessage) ([]ModelEntry, []Warning) {
+	var warnings []Warning
+	out := make([]ModelEntry, 0, len(rows))
+	for i, row := range rows {
+		var e wireModelEntry
+		if err := json.Unmarshal(row, &e); err != nil {
+			// Not an object. The row is dropped with a warning rather than
+			// failing the listing: it is not the row the caller is looking
+			// for, or the caller will find it missing and say so.
+			warnings = append(warnings, Warning{Kind: WarnOther, Feature: "models",
+				Details: fmt.Sprintf("entry %d is not an object and was skipped", i)})
+			continue
+		}
+		var id string
+		if err := json.Unmarshal(e.ID, &id); err != nil || id == "" {
+			warnings = append(warnings, Warning{Kind: WarnOther, Feature: "models",
+				Details: fmt.Sprintf("entry %d has no string id and was skipped", i)})
+			continue
+		}
+		entry := ModelEntry{ID: id, Raw: row}
+		entry.MaxInputTokens = limitField(id, "max_input_tokens", e.MaxInputTokens, &warnings)
+		if len(e.MaxOutputTokens) == 0 && len(e.MaxTokens) > 0 {
+			entry.MaxOutputTokens = limitField(id, "max_tokens", e.MaxTokens, &warnings)
+		} else {
+			entry.MaxOutputTokens = limitField(id, "max_output_tokens", e.MaxOutputTokens, &warnings)
+		}
+		out = append(out, entry)
+	}
+	return out, warnings
+}
+
+// limitField reads one of the gateway's token limits.
+//
+// LiteLLM emits an int, but its info endpoints have been seen with integral
+// floats (16385.0), so those are accepted. Anything else that is present is a
+// warning and nil, never a number: a bool decodes as 1 under a lenient cast, a
+// fraction rounds, and a zero or negative window would size every prompt to
+// nothing. Absent and null are plain nil, no warning, because a plain OpenAI
+// listing never carries the field.
+func limitField(model, name string, raw json.RawMessage, warnings *[]Warning) *int64 {
+	if len(raw) == 0 || isJSONNull(raw) {
+		return nil
+	}
+	unusable := func(why string) *int64 {
+		*warnings = append(*warnings, Warning{Kind: WarnOther, Feature: name,
+			Details: fmt.Sprintf("model %q lists %s as %s, %s", model, name,
+				Truncate(Redact(string(raw)), maxErrorBody), why)})
+		return nil
+	}
+	// json.Number would also accept a quoted "400000"; a string is not a
+	// number here, whatever it contains.
+	var num json.Number
+	if bytes.HasPrefix(bytes.TrimSpace(raw), []byte{'"'}) || json.Unmarshal(raw, &num) != nil {
+		return unusable("not a number")
+	}
+	// big.Rat rather than ParseFloat: it says exactly whether the value is an
+	// integer, where a float comparison would pass 2^53+1 as one. The
+	// grammar check first bounds the exponent: 1e9999999 is a legal JSON
+	// number and an allocation the listing would otherwise get to size.
+	if !finiteDecimal.MatchString(num.String()) {
+		return unusable("not a finite number")
+	}
+	r, ok := new(big.Rat).SetString(num.String())
+	if !ok || !r.IsInt() {
+		return unusable("not an integer")
+	}
+	if !r.Num().IsInt64() {
+		return unusable("out of range")
+	}
+	v := r.Num().Int64()
+	if v <= 0 {
+		return unusable("not positive")
+	}
+	return &v
+}

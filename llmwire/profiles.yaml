@@ -1,0 +1,1182 @@
+# Model profiles.
+#
+# Hardcoded and embedded, never fetched at runtime. Published catalogues
+# (models.dev, LiteLLM's model_prices_and_context_window.json) are an AUTHORING
+# source to cross-check against; a runtime dependency on one buys a network
+# call, a cache, a staleness window and a fallback table, and this file is the
+# fallback table.
+#
+# Every entry marked `verified: measured` was probed in eval_probe_test.go
+# (eval_messages_test.go for the Messages protocol) against the live endpoint,
+# and FINDINGS.md records what each probe saw. The flag is per profile; each bit's comment says MEASURED or NOT measured, and a
+# NOT measured bit is the vendor's documentation carried until a probe reads it.
+# Six of the measurements contradict a vendor doc. Where they disagree, this
+# file follows the measurement.
+#
+# Adding a model: follow ONBOARDING.md. In short: write the entry, run
+# `LLMWIRE_EVAL=1 go test -run Probe`, mark each bit's comment MEASURED or NOT
+# measured, and set `verified: measured` once the profile has been probed. An
+# unmeasured field is left absent rather than guessed — absent means "assume
+# nothing", not "assume the default".
+
+# Providers: the host and account a profile is reached through. The URL lives
+# HERE, once, so an application supplies LLMWIRE_<PROVIDER>_API_KEY and nothing
+# else. LLMWIRE_<PROVIDER>_BASE_URL exists only for a provider that ships no
+# host; beside a shipped host it is refused, not honoured: a different host
+# is a different entry here. Roots only: no /chat/completions, the client
+# appends the route; no query string, a key there is echoed by every error
+# body.
+providers:
+  zai:
+    # The GENERAL host. NEVER /api/coding/paas/v4: the Coding Plan host is
+    # restricted to Z.ai's own coding tools and refuses everything else. No
+    # /v1 on this vendor.
+    base_url: https://api.z.ai/api/paas/v4
+  mimo:
+    # The Token Plan host, which is what `provider: mimo` means throughout this
+    # file; the pay-as-you-go API is api.xiaomimimo.com/v1 with a different
+    # key, and would be its own provider. Sold as opencode's backend: a
+    # neutral User-Agent is refused as a bot, so FromEnv presents as that
+    # client (Config.EmulateOpenCode) for every profile on this provider.
+    base_url: https://token-plan-sgp.xiaomimimo.com/v1
+    emulate_opencode: true
+  openai:
+    base_url: https://api.openai.com/v1
+  # Anthropic's own API, which speaks Messages only (wire_api: messages). The
+  # key goes in x-api-key: a bearer API key is refused. anthropic-version is
+  # required on every request and fixes what the body means; 2026-10-21 is the
+  # version whose Messages requests refuse temperature/top_p/top_k on every
+  # model (claude-api skill, api-version migration).
+  anthropic:
+    base_url: https://api.anthropic.com/v1
+    api_key_header: x-api-key
+    headers:
+      anthropic-version: "2026-10-21"
+  # A self-hosted gateway has no public host: LLMWIRE_LITELLM_BASE_URL is
+  # required.
+  litellm: {}
+
+profiles:
+  # ---------------------------------------------------------------------------
+  # Z.ai, general (pay-as-you-go) host. NOT the Coding Plan host, which is
+  # restricted to that plan's own tools and refuses calls from elsewhere.
+  # ---------------------------------------------------------------------------
+  - id: glm-5.3-flash
+    display_name: GLM 5.3 Flash
+    endpoint: chat
+    wire_model_id: glm-5.3-flash
+    provider: zai
+    verified: measured
+
+    # MEASURED, and the single most expensive quirk in this file. This endpoint
+    # ACCEPTS max_completion_tokens and then IGNORES it: a request capping at 16
+    # returned 481 completion tokens with finish_reason "stop". No rejection, no
+    # warning, nothing to notice. Sending the wrong parameter name here means
+    # unbounded output, not an error.
+    max_tokens_param: max_tokens
+
+    reasoning:
+      supported: true
+      # NOT measured directly: no probe sent a request with no knob and read
+      # the reasoning tokens. Inferred from the endpoint's own refusal below,
+      # "This model always engages in thinking".
+      enabled_by_default: true
+      # MEASURED: thinking:{"type":"disabled"} is refused outright —
+      #   status 400, code 1210
+      #   "This model always engages in thinking and cannot be disabled;
+      #    please use low, high, or max"
+      # Z.ai's own API reference documents the disable toggle as valid. It is
+      # not, on this model. The measurement wins.
+      can_be_disabled: false
+      control: effort
+      # MEASURED, exactly this set. The provider's global enum has seven values;
+      # this model takes three. none, minimal, medium and xhigh are ALL refused
+      # with the same code 1210 and the same message as the disable toggle —
+      # so the code is overloaded across two unrelated conditions, and the
+      # message names only a subset of what it rejects. Dispatching on the prose
+      # would be wrong twice over.
+      effort_values: [low, high, max]
+      # NOT measured: the vendor's documented default and their recommendation
+      # for this model.
+      default_effort: max
+      # NOT measured: a choice, not a probe result. One rung below the max
+      # default, the fast-but-not-shallow point. ReasoningMinimal needs no
+      # entry: this model cannot be disabled, so it resolves to low, the
+      # first of effort_values.
+      balanced: high
+      # low and high MEASURED 2026-11-01, ZaiReasoningOverhead, two runs: a
+      # memory-refresh prompt (system prompt, sectioned memory, multi-turn
+      # transcript), cap 16384, five samples per level and prompt size, no
+      # call cut in either run. Reasoning tokens, min / p50 / max:
+      #
+      #   prompt    low              high
+      #   ~2.8k     183 / 199 / 324   542 /  871 / 1047   run 1
+      #   ~7.2k     174 / 275 / 466  1110 / 1543 / 2270   run 1
+      #   ~16.1k    218 / 260 / 826  1476 / 2437 / 3110   run 1
+      #   ~3.1k     164 / 188 / 381   517 /  836 / 1450   run 2
+      #   ~8.0k     134 / 233 / 315   861 / 1529 / 1689   run 2
+      #   ~20.0k    254 / 295 / 400  1032 / 1322 / 5166   run 2
+      #
+      # Each figure is the max of the 30 clean draws rounded up to 512: low
+      # 826 -> 1024, high 5166 -> 5632. low barely moves with input. high
+      # mostly sits at 0.5k-2.6k and grows with the prompt, then takes a
+      # deep pass: one draw in five on a 20k prompt reasoned 5166. A
+      # consumer's production at high saw 459-1600 and two calls cut at the
+      # old 1024 allowance (>=2834, >=2923, prompts up to 17.5k). Nothing
+      # past 20k was measured, and a fixed per-level figure cannot follow
+      # the input size.
+      # max ABSENT, NOT measured: it and the no-knob case (default_effort max)
+      # fall back to DefaultReasoningOverhead (1024), known short there (the
+      # notes: a 1024 cap at max produced zero content). The consumer that
+      # prompted this asks Balanced, never max.
+      overhead: {low: 1024, high: 5632}
+      # MEASURED: reasoning arrived on this delta field on every probe.
+      stream_field: reasoning_content
+
+    # NOT measured, vendor documentation. Sent explicitly rather than omitted:
+    # the endpoint's own fallbacks are materially lower than the vendor's
+    # recommended operating point, so leaving these out does not mean "the
+    # model's defaults" — it means running the model off the point it was tuned
+    # for.
+    temperature:
+      supported: true
+      recommended_value: 1.0
+    top_p:
+      supported: true
+      recommended_value: 0.95
+
+    tools:
+      supported: true
+      # NOT measured: the tool-format probes ran against MiMo only. Documented
+      # as native; nothing has been seen to contradict it.
+      format: native
+      # Documented as auto-only. NOT measured: no probe offered a forced choice
+      # to this endpoint, so this follows the doc and is the weakest line here.
+      tool_choice_values: [auto]
+      supports_forced_choice: false
+
+    output:
+      # MEASURED: accepted and the reply parsed as JSON.
+      json_object: true
+      # MEASURED: accepted and honoured, despite json_schema being absent from
+      # Z.ai's OpenAPI enum and from their documentation entirely. A third-party
+      # aggregator claimed support and was right.
+      json_schema: true
+      # MEASURED: the probe sent "strict": true inside the json_schema block.
+      strict_schema: true
+
+    streaming:
+      supported: true
+      # MEASURED both ways: usage arrives without asking, and the parameter is
+      # accepted anyway (its request schema does not list it).
+      needs_include_usage: false
+      accepts_stream_options: true
+
+    # NOT measured, vendor documentation.
+    limits:
+      context: 1000000
+      max_output: 131072
+
+    # NOT measured: the image probe ran against MiMo only. Vendor documentation.
+    vision: true
+    # NOT measured: vendor documentation. Only "stop" and "length" have been
+    # seen from this endpoint.
+    finish_reasons_extra: [sensitive, model_context_window_exceeded, network_error]
+
+    # Published pay-as-you-go USD list rate, per 1M tokens, read from the
+    # vendor's own page. models.dev carries 0.075 / 0.015 / 0.25 — exactly half
+    # on every lane — and the reason is worth keeping: its entry for this model
+    # is dated 2026-08-26, the model's own release day, and has not been touched
+    # since. It is a launch-day snapshot presented as current. A backend that
+    # sourced its rates there in August shipped figures at half the real price
+    # for two weeks, and nothing in its own table could have revealed that.
+    #
+    # This is what source_url and verified_on are for. A catalogue is a
+    # cross-check, never a source.
+    #
+    # cache_write is 0 because the vendor lists cached-input storage as
+    # "Limited-time Free". That is a promotion, not a property: when it ends this
+    # becomes a real rate, and the 0 here is an explicit measurement of what the
+    # page said on verified_on, not an assumption that the lane is free.
+    #
+    # cache_read MEASURED 2026-09-13: cached_tokens sits INSIDE prompt_tokens
+    # (9208 prompt / 0 cached, then 9208 / 9152 on the identical prompt), on
+    # prompt_tokens_details.cached_tokens. The full-rate lane is the difference.
+    #
+    # NO WINDOW IS ATTACHED, deliberately. Z.ai documents a Mon-Fri 14:00-18:00
+    # Asia/Singapore peak with everything else, weekends included, at 0.5x — but
+    # documents it as a COEFFICIENT ON CREDIT BURN, and whether it touches the
+    # USD lane is unverified (FINDINGS.md, "Still open"). Attaching 0.5x would
+    # halve reported spend on the only priced chat model here, and a halved
+    # figure silently doubles what a fail-closed budget cap permits. Assumption
+    # until measured: the USD lane bills at list around the clock.
+    cost:
+      input: 0.15
+      cache_read: 0.03
+      cache_write: 0
+      output: 0.50
+      source_url: https://docs.z.ai/guides/overview/pricing
+      verified_on: 2026-09-12
+
+    notes: >-
+      A 1024-token cap at reasoning_effort max produced 1022 stream frames and
+      ZERO content characters: the whole budget went to reasoning. The cap counts
+      reasoning tokens, so sizing it tightly on a deep call returns an empty
+      answer with finish_reason "length" and no error.
+
+  # ---------------------------------------------------------------------------
+  # Xiaomi MiMo V2.6, measured 2026-09-22. Reached here over a Token Plan host,
+  # which bills subscription credits rather than dollars. `provider: mimo` means
+  # THAT host; the pay-as-you-go API is a different host with a different key
+  # and would be its own provider.
+  #
+  # RETIRED 2026-10-31: mimo-v2.5-pro and mimo-v2.5, deprecated by the vendor
+  # 2026-10-21 and no longer served. Comparisons with them below are
+  # measurement history; FINDINGS.md has the V2.5 probes.
+  #
+  # Nothing here was inherited from the V2.5 entries. Identical published
+  # prices and an identically documented thinking toggle made a copy tempting,
+  # and a copy would have shipped two wrong bits: V2.5-pro REJECTED image input
+  # and V2.6-pro accepts it, and V2.5 reported a reasoning lane of 0 while V2.6
+  # populates it. Every bit below is marked MEASURED or NOT measured.
+  # ---------------------------------------------------------------------------
+  - id: mimo-v2.6-pro
+    display_name: MiMo V2.6 Pro
+    endpoint: chat
+    wire_model_id: mimo-v2.6-pro
+    provider: mimo
+    verified: measured
+
+    # MEASURED: this endpoint honours BOTH max_tokens and max_completion_tokens
+    # — each returned exactly 16 tokens with finish_reason "length", the same
+    # result as V2.5-pro. The explicit one is sent because it is the name the
+    # vendor's own model card uses in its sample code.
+    max_tokens_param: max_completion_tokens
+
+    reasoning:
+      supported: true
+      # MEASURED 2026-09-22, and this is the first direct measurement of MiMo's
+      # thinking toggle in either direction: both retired V2.5 entries carried
+      # these two bools on vendor documentation alone.
+      #
+      # The card documents the disable shape as extra_body {"thinking":
+      # {"type": "disabled"}}; extra_body is the OpenAI SDK's passthrough, so
+      # on the wire it is a top-level "thinking" object. Sent as such it is
+      # ACCEPTED AND HONOURED: on the arithmetic prompt below, reasoning tokens
+      # went 54 -> 0 while the answer stayed correct ("205" both ways).
+      #
+      # enabled_by_default is read off the same pair: the request with NO knob
+      # at all reported 54 reasoning tokens, so thinking is on unless switched
+      # off. Worth contrasting with Z.ai, where the vendor also documents this
+      # toggle and the endpoint refuses it outright (code 1210).
+      #
+      # RE-MEASURED 2026-09-23, two runs: 78 -> 0 on the same prompt, answer
+      # "205" both ways. The other run's control call got no response headers
+      # within 60s, so it has only the disabled half (0). The direction holds;
+      # the count on the control moves run to run (54, 78), so read it as
+      # "tens of tokens", not as a figure.
+      enabled_by_default: true
+      can_be_disabled: true
+      control: toggle_object
+      # MEASURED 2026-09-22: the set is enforced by the endpoint — low, medium
+      # and high return 200, xhigh is a 400 "Invalid request parameters". Same
+      # set as V2.5.
+      #
+      # THE LADDER IS NOT A LADDER. MiMoEffortLadderIsReal, five samples per
+      # level on a variable-depth prompt ("list every prime between 100 and
+      # 200"), reasoning tokens, two runs a day apart:
+      #               2026-09-22                 2026-09-23
+      #   no level  [120 120 656 273 104]    [117 117 121 272 120]
+      #   low       [121 507 120 122 121]    [351 125 632 121 2230]
+      #   medium    [120 148 120 120 121]    [120 120 121 120 117]
+      #   high      [121 255 121 1088 104]   [1923 1024 1252 536 121]
+      # Every range overlaps every other in both runs, so the three levels are
+      # not three settings. The first run read as "a ~104-150 floor at every
+      # level with one outlier each"; the second does not: high went deep in
+      # four of five, low in three. Both runs together: medium stayed in
+      # 117-148 in ten of ten, high went past 500 in five of ten. That leans
+      # towards high thinking deeper more often and medium capping it, but
+      # ten samples a cell with overlapping ranges does not settle it.
+      #
+      # What a caller can rely on: a level does not buy a predictable amount
+      # of thinking, and high can cost 15x medium on the same prompt. Use the
+      # thinking toggle, which IS honoured cleanly. Do not build a cost model
+      # on a level.
+      #
+      # An earlier one-sample-per-level run read 67/69/74 against 197 for no
+      # level and suggested any level SUPPRESSES thinking. That does not
+      # reproduce: at n=5 the no-level range (104-656) overlaps every level.
+      # Kept as the reason this file trusts ranges over points.
+      effort_values: [low, medium, high]
+      # medium is the level whose range stayed tight (117-148, ten of ten)
+      # in the table above, the nearest thing to "fast but not shallow" this
+      # ladder offers. A reading of two five-sample runs, not a guarantee.
+      # overhead ABSENT, NOT measured as an allowance: those counts are one
+      # prompt's reasoning, so DefaultReasoningOverhead applies.
+      balanced: medium
+      # NOT measured: reasoning arrived on every probe, but stream.go reads both
+      # `reasoning_content` and `reasoning` and content wins, so which key the
+      # delta carried cannot be read back out of a StreamResult. The family's
+      # spelling, recorded; nothing in the library reads this field.
+      stream_field: reasoning_content
+
+    # NOT measured on this generation. supported stays true because these are
+    # accepted — dropping the block would have Validate refuse a caller that
+    # sends either — but inert_while_reasoning is deliberately ABSENT, unlike
+    # the retired V2.5 entries: that bit rests on a vendor statement that the model
+    # forcibly overrides both while thinking, and no V2.6 source has been found
+    # repeating it. Absent means the warning is not emitted; it does not change
+    # what is sent.
+    temperature:
+      supported: true
+    top_p:
+      supported: true
+
+    tools:
+      supported: true
+      # MEASURED: native tool_calls, both with tools offered (name came back as
+      # get_weather) and on a forced tool-free call, which returned clean prose
+      # with no markup in either channel.
+      format: native
+      # recover_inline_markup is ON although no probe reproduces the leak here
+      # either, for the same reason it was on V2.5: loom captured it in
+      # production against a long, tool-saturated history, as
+      # <tool_call>…</tool_call> blocks and as an invented
+      # <tool_invocation name=… arguments={…} /> form, on tool-free calls too,
+      # and no probe builds that history. Failing to reproduce is not
+      # refuting, and recovery only acts when the markup appears, so a clean
+      # answer costs nothing.
+      recover_inline_markup: true
+      # NOT measured, all three: no probe has offered a forced choice or two
+      # tools in one turn to ANY MiMo endpoint. Vendor documentation, at the
+      # same values as the rest of the family.
+      #
+      # They are present rather than absent for two different reasons, neither
+      # of which is evidence. tool_choice_values cannot be empty while tools
+      # are supported (profile.go validate), so the doc's value is the only
+      # loadable option short of dropping tool support. supports_parallel has
+      # no reader in the library at all today — grep finds only its field
+      # declaration — so the `true` here gates nothing and refuses nothing; it
+      # records the vendor's claim. If a caller ever routes on it, measure it
+      # first.
+      tool_choice_values: [auto]
+      supports_forced_choice: false
+      supports_parallel: true
+
+    output:
+      # MEASURED: accepted and the raw reply parsed as JSON.
+      json_object: true
+      # MEASURED: accepted and honoured, though the model card documents only
+      # "Structured Output" without naming the parameter.
+      json_schema: true
+      # MEASURED: the probe sent "strict": true inside the json_schema block.
+      strict_schema: true
+
+    # MEASURED both ways: usage arrives without asking (raw
+    # completion_tokens/prompt_tokens/total_tokens plus
+    # completion_tokens_details.reasoning_tokens and
+    # prompt_tokens_details.cached_tokens), and stream_options is accepted.
+    streaming:
+      supported: true
+      needs_include_usage: false
+      accepts_stream_options: true
+      # OBSERVED in production (loom), not probed: a tool call streams its
+      # name, then NOTHING while the whole argument is serialized server-side,
+      # then the argument in one burst. A ~10KB document argument measured
+      # ~82s of silence: past any idle bound sized for prose, and 8s short of
+      # the 90s default. Seen on V2.5, which MiMo id is not recorded, so it is
+      # set on every MiMo entry: the serving layer is shared. Callers widen
+      # ChatRequest.ToolCallIdleTimeout on turns offering such a tool.
+      buffers_tool_args: true
+
+    # NOT measured, vendor model card: "Context Window 1M tokens" /
+    # "Max Output 128K tokens". No probe sent a cap above the ceiling; every
+    # endpoint measured so far clamps silently rather than erroring.
+    limits:
+      context: 1048576
+      max_output: 131072
+
+    # MEASURED 2026-09-22, and this REVERSES the V2.5 split. An image_url part
+    # is ACCEPTED here, where the same part against mimo-v2.5-pro returned HTTP
+    # 404 "No endpoints found that support image input" — re-confirmed as a
+    # control in the same run. The vendor's own model card is self-contradictory
+    # on this point: the prose sells "Omni-Modal Understanding" and "joint input
+    # and understanding of images, video, audio, and text", while the
+    # specification table on the same page lists "Input Modality: Text", and
+    # OpenRouter documents text only. The prose is right.
+    vision: true
+    # NOT measured: vendor documentation. Only "stop" and "length" have been
+    # seen from this endpoint.
+    finish_reasons_extra: [repetition_truncation]
+
+    # Published pay-as-you-go USD list rate per 1M tokens, from the vendor's own
+    # page, Overseas (USD) table. THIS IS NOT AN INVOICE: this deployment is
+    # reached over a Token Plan host that bills subscription credits, and
+    # llmwire reports the list USD rate anyway, because a credit figure is not
+    # comparable between models and reporting nothing leaves a budget cap with
+    # nothing to check.
+    #
+    # No cross-check exists for this generation: models.dev carries no
+    # mimo-v2.6 entry at all as of verified_on. Both retired V2.5 prices had a
+    # third-party figure to disagree with; this one stands on the vendor page
+    # alone. The rates happen to equal mimo-v2.5-pro's exactly.
+    #
+    # cache_write 0: the vendor lists cache writes as "Limited-time Free" — a
+    # promotion as of verified_on, not a property of the lane.
+    #
+    # Not attached, deliberately: the page also advertises a 50% Batch API
+    # discount for this model. Batch is a different route with its own latency
+    # contract, not a window on this one.
+    cost:
+      input: 0.435
+      cache_read: 0.0036
+      cache_write: 0
+      output: 0.87
+      source_url: https://mimo.mi.com/docs/en-US/price/pay-as-you-go
+      verified_on: 2026-09-22
+
+    notes: >-
+      Succeeds mimo-v2.5-pro, retired 2026-10-31, and differs from it in two
+      ways a caller moving over can trip over. It ACCEPTS image input where
+      -pro returned 404, so the vision split this library used to
+      route around does not exist at this generation. And it populates the
+      reasoning lane: 197 of 202 completion tokens on one arithmetic prompt
+      came back as reasoning_tokens, where mimo-v2.5 reported 0 and counted
+      thinking inside completion_tokens. Code that read the lane as "this model
+      does not think" will now see the real figure. Measured 2026-09-22:
+      cached_tokens sits INSIDE prompt_tokens (0 then 10880 against a
+      prompt_tokens of 10909 on the identical prompt), so the full-rate lane is
+      the difference and pricing subtracts it. Unlike mimo-v2.5-pro this
+      endpoint starts COLD — 0 cached on a fresh 10.9k prompt, where
+      mimo-v2.5-pro reported 192 of 258 because it injects its own system
+      message. Latency is NOT reliably low. On 2026-09-22 every call took 1-5
+      seconds. On 2026-09-23 typical calls took 1.5-9 seconds, and two of about
+      45 failed outright: one with no response headers within 60s, one with a
+      stream that stopped mid-answer until the 90s idle guard aborted it, where
+      the day before its longest data-frame gap was 1.2s. One evening's
+      sample, so vendor load may be part of it; a caller should still budget
+      for the timeout, not the median. reasoning_effort is accepted with an
+      enforced set despite appearing in no vendor document for this model, but
+      it does NOT give a caller three settings: at five samples per level,
+      twice, every range overlaps every other. Reach for the thinking toggle
+      instead, which is honoured cleanly and wins over an effort level sent in
+      the same request.
+
+  - id: mimo-v2.6-flash
+    display_name: MiMo V2.6 Flash
+    endpoint: chat
+    wire_model_id: mimo-v2.6-flash
+    provider: mimo
+    verified: measured
+
+    # MEASURED: both names honoured, 16 tokens with finish_reason "length",
+    # same as -pro. The documented one is sent.
+    max_tokens_param: max_completion_tokens
+
+    reasoning:
+      supported: true
+      # MEASURED 2026-09-22, independently of -pro: the thinking toggle is
+      # ACCEPTED AND HONOURED here too, reasoning tokens 42 -> 0, and the
+      # no-knob control reported 42, so thinking is on by default.
+      #
+      # RE-MEASURED 2026-09-23, two runs: 27 -> 0 and 54 -> 0 (42 the day
+      # before). Honoured every time; the control count is not a figure.
+      #
+      # One caveat -pro does not show: with thinking disabled this model
+      # answers the arithmetic prompt WRONG. Seven of seven calls that sent the
+      # toggle got it wrong, each a different number: "155", "145", "195" on
+      # 2026-09-22, then "145", "195", and "105", "185" with reasoning_effort
+      # high beside the toggle, on 2026-09-23. The correct "205" came back on
+      # every thinking-on call. With thinking off this model guesses at
+      # one-step arithmetic; disabling it here is a quality decision, not only
+      # a latency one. -pro answered correctly with thinking off every time.
+      enabled_by_default: true
+      can_be_disabled: true
+      # OBSERVED 2026-09-22 in production, not reproduced by a probe: a
+      # tool-free call with thinking disabled, after a multi-turn tool
+      # history, answered with a draft, a stray "</think>" and then the
+      # answer, all in content, and 0 reasoning tokens. The caller parsed the
+      # draft as the answer. A short probe prompt never showed it. Not seen on
+      # -pro, so not set there.
+      leaks_close_tag: true
+      control: toggle_object
+      # MEASURED 2026-09-22: same enforced set as -pro, xhigh a 400 "Invalid
+      # request parameters".
+      #
+      # THE LADDER IS NOT A LADDER. Five samples per level, same prompt as
+      # -pro, reasoning tokens, two runs a day apart:
+      #               2026-09-22                 2026-09-23
+      #   no level  [1784 120 117 117 117]   [117 2328 117 104 118]
+      #   low       [104 117 117 117 121]    [15 117 120 117 118]
+      #   medium    [121 117 117 118 120]    [117 104 104 625 120]
+      #   high      [104 104 117 117 117]    [118 847 117 104 118]
+      # The first run had the three levels within 17 tokens of each other; the
+      # second drew deep passes at medium (625) and high (847). Every range
+      # overlaps every other in both. All but three samples sit in ~104-121
+      # whatever the level, and the deepest pass either day (2328) came with no
+      # level at all. What varies is whether a call takes a deep pass, not the
+      # level.
+      #
+      # Use the thinking toggle, which is honoured cleanly. A level is accepted
+      # and does not buy a caller a different amount of thinking.
+      effort_values: [low, medium, high]
+      # NOT measured as a depth: per the table above no level moves this
+      # model, so medium is the family's value and costs nothing to send.
+      # ReasoningMinimal resolves to OFF here, and off answers one-step
+      # arithmetic wrong (notes); a caller that needs the answer right uses
+      # Balanced.
+      balanced: medium
+      # OBSERVED 2026-10-25 in a consumer's production (peeq, long-form
+      # summaries with no knob sent), not reproduced by a probe: with
+      # DefaultReasoningOverhead the wire cap was 5120 (4096 answer + 1024),
+      # and two calls in ten ended finish_reason "length" with output_tokens
+      # 5120, reasoning_tokens 5089 and 5126 (the vendor's reasoning count
+      # runs a few tokens past its own output count) and 119 and 0 chars of
+      # content. The deep pass the table above samples is real on long inputs
+      # and outlasts 1024 by 5x. Both were cut, so ~5.1k is a floor, not a
+      # depth: 8192 is a budget above it, not a measurement. Not higher: at
+      # the slowest output recorded below (18 tok/s) a 4096 answer + 8192
+      # finishes in ~11 minutes, inside DefaultCallTimeout; + 16384 would not.
+      # Only "default" is keyed, the case the cuts were seen in; the levels'
+      # probe samples stayed under 1024, so they keep the package default.
+      overhead: {default: 8192}
+      # NOT measured, for the same reason as -pro: the delta key cannot be read
+      # back out of a StreamResult. The family's spelling, recorded.
+      stream_field: reasoning_content
+
+    # NOT measured; same reasoning as -pro above, including why
+    # inert_while_reasoning is absent rather than carried over from V2.5.
+    temperature:
+      supported: true
+    top_p:
+      supported: true
+
+    tools:
+      supported: true
+      # MEASURED: native tool_calls with tools offered, clean prose on a
+      # tool-free call.
+      format: native
+      # Same serving layer and same defensive reasoning as -pro.
+      recover_inline_markup: true
+      # NOT measured, all three; see the -pro entry for why they are present
+      # rather than absent. supports_parallel has no reader in the library, so
+      # it records the vendor's claim and gates nothing.
+      tool_choice_values: [auto]
+      supports_forced_choice: false
+      supports_parallel: true
+
+    # MEASURED: accepted, and the raw reply parsed as JSON in both shapes;
+    # strict was sent inside the schema block.
+    output:
+      json_object: true
+      json_schema: true
+      strict_schema: true
+
+    # MEASURED both ways, same as -pro.
+    streaming:
+      supported: true
+      needs_include_usage: false
+      accepts_stream_options: true
+      # OBSERVED on MiMo, not probed on this generation; see mimo-v2.6-pro.
+      buffers_tool_args: true
+
+    # NOT measured, vendor model card: 1M context / 128K max output. Note the
+    # version delta — mimo-v2.5 shipped max_output 32768, so the ceiling on the
+    # cheaper model moved 4x at this bump and now matches -pro.
+    limits:
+      context: 1048576
+      max_output: 131072
+
+    # MEASURED: accepts an image_url part, like its V2.5 predecessor and unlike
+    # mimo-v2.5-pro. Carries the same card-versus-spec-table contradiction as
+    # -pro; the prose is right here too.
+    vision: true
+    # NOT measured: vendor documentation.
+    finish_reasons_extra: [repetition_truncation]
+
+    # Same page, same table, same caveats as mimo-v2.6-pro above: list USD rate
+    # rather than the credit invoice this route bills, no models.dev entry to
+    # cross-check against, cache_write a promotion, and the 50% Batch API
+    # discount deliberately not modelled as a window. Rates equal mimo-v2.5's
+    # exactly.
+    cost:
+      input: 0.14
+      cache_read: 0.0028
+      cache_write: 0
+      output: 0.28
+      source_url: https://mimo.mi.com/docs/en-US/price/pay-as-you-go
+      verified_on: 2026-09-22
+
+    notes: >-
+      Succeeds mimo-v2.5, retired 2026-10-31. The vendor
+      describes a 309B-parameter Mixture-of-Experts model with 15B activated per
+      token, and gives it the same 1M/128K window as -pro where its predecessor
+      had max_output 32768. On 2026-09-22 it was the fastest endpoint measured
+      in this file, 0.9-2.6 seconds per call; on 2026-09-23 short calls took
+      1.8-3.5 seconds to headers, a probe of two calls took 29 seconds, and
+      output ran at 18-36 tokens per second. No call failed, and the longest
+      data-frame gap stayed under 522ms against the 90s idle bound. Like -pro
+      it populates the reasoning lane rather than hiding thinking inside
+      completion_tokens, starts with a cold cache, and contains cached_tokens
+      inside prompt_tokens. reasoning_effort is accepted but buys nothing
+      measurable: at five samples per level, twice, every range overlaps every
+      other. Use the thinking toggle, which is honoured cleanly and wins over
+      an effort level sent in the same request. A call with no knob can take a
+      deep pass past 5k reasoning tokens on a long input, so MaxAnswerTokens
+      adds 8192 there, not the package default; expect a wire cap well above
+      the answer asked for.
+      DISABLING THINKING COSTS CORRECTNESS HERE. The same one-step arithmetic
+      prompt (answer 205) came back wrong on seven of seven thinking-off calls
+      across two days, a different number each time (155, 145, 195, 105,
+      185), and correct on every thinking-on call. On this model ReasoningOff()
+      is a quality decision, not only a latency one. mimo-v2.6-pro answered
+      correctly with thinking off every time.
+  # ---------------------------------------------------------------------------
+  # OpenAI embeddings.
+  # ---------------------------------------------------------------------------
+  - id: text-embedding-3-small
+    display_name: Text Embedding 3 Small
+    endpoint: embeddings
+    wire_model_id: text-embedding-3-small
+    provider: openai
+    verified: source-derived
+    limits:
+      # Per-input token ceiling. The API reference says 8192 and the cookbook
+      # says 8191; the lower figure is used, since the cost of being one token
+      # conservative is nothing and the cost of being one over is a 400.
+      context: 8191
+    # Only the -3 generation takes the dimensions parameter; older embedding
+    # models reject it outright, so this cannot be inferred from the endpoint.
+    #
+    # default_dimensions is what a caller builds its vector column and index to.
+    # Full-length vectors from this model are unit length; a caller that shortens
+    # one by hand must renormalise, which is why the dimensions PARAMETER is the
+    # supported way to get a shorter vector.
+    embedding:
+      dimensions: true
+      default_dimensions: 1536
+    # One lane: there is no completion side to an embeddings call, and the other
+    # three lanes must stay ABSENT rather than 0, so nothing reads "measured
+    # free" where the truth is "no such lane".
+    cost:
+      input: 0.02
+      source_url: https://developers.openai.com/api/docs/pricing
+      verified_on: 2026-09-12
+    notes: >-
+      Over-length input is rejected, never truncated: at most 2048 inputs per
+      request and 300000 tokens summed across them.
+
+  - id: text-embedding-3-large
+    display_name: Text Embedding 3 Large
+    endpoint: embeddings
+    wire_model_id: text-embedding-3-large
+    provider: openai
+    verified: source-derived
+    limits:
+      context: 8191
+    embedding:
+      dimensions: true
+      default_dimensions: 3072
+    cost:
+      input: 0.13
+      source_url: https://developers.openai.com/api/docs/pricing
+      verified_on: 2026-09-12
+    notes: Same request limits as the -small model.
+
+  # ---------------------------------------------------------------------------
+  # OpenAI chat. Onboarded as the model behind a LiteLLM gateway route
+  # (LLMWIRE_LITELLM_MODELS); nothing here was probed against api.openai.com,
+  # every bit is the model page and the API reference, dated below.
+  # ---------------------------------------------------------------------------
+  - id: gpt-5.4-mini
+    display_name: GPT-5.4 mini
+    endpoint: chat
+    wire_model_id: gpt-5.4-mini
+    provider: openai
+    verified: source-derived
+
+    # NOT measured: the API reference deprecates max_tokens for the reasoning
+    # series and names max_completion_tokens as the cap.
+    max_tokens_param: max_completion_tokens
+
+    # NOT measured, model page 2026-09-15: "supports reasoning effort levels of
+    # none, low, medium, high, and xhigh". none is the off switch, so the model
+    # can be told not to think. It thinks when the field is omitted (the
+    # series' documented default is medium, which this model's own page does
+    # not restate), so default_effort stays absent rather than guessed.
+    reasoning:
+      supported: true
+      enabled_by_default: true
+      can_be_disabled: true
+      control: effort
+      effort_values: [none, low, medium, high, xhigh]
+      # NOT measured, a choice: the series' documented default, the middle of
+      # the set. Same on every gpt-5.x entry. overhead ABSENT:
+      # DefaultReasoningOverhead applies.
+      balanced: medium
+
+    # NOT measured on this model; the gpt-5 series answers a non-default
+    # temperature with a 400 ("Unsupported value ... Only the default (1) value
+    # is supported"), which is the forced_value shape. Same for top_p.
+    temperature:
+      supported: true
+      forced_value: 1.0
+    top_p:
+      supported: true
+      forced_value: 1.0
+
+    # NOT measured, API reference.
+    tools:
+      supported: true
+      format: native
+      tool_choice_values: [auto, none, required]
+      supports_forced_choice: true
+      supports_parallel: true
+
+    # NOT measured, API reference: response_format json_object and json_schema
+    # with strict.
+    output:
+      json_object: true
+      json_schema: true
+      strict_schema: true
+
+    # NOT measured, API reference: usage arrives in the stream only when
+    # stream_options.include_usage is sent.
+    streaming:
+      supported: true
+      needs_include_usage: true
+      accepts_stream_options: true
+
+    # NOT measured, model page: 400,000-token context, 128,000 maximum output.
+    limits:
+      context: 400000
+      max_output: 128000
+
+    # NOT measured, model page: text and image in, text out.
+    vision: true
+
+    # Pricing page, standard tier, same figures on the model page. cache_write
+    # is 0: OpenAI charges nothing to write the prompt cache. Behind a gateway
+    # this block is dropped and the proxy's own figure is used (Profile.resolve).
+    cost:
+      input: 0.75
+      cache_read: 0.075
+      cache_write: 0
+      output: 4.50
+      source_url: https://developers.openai.com/api/docs/pricing
+      verified_on: 2026-09-15
+
+    notes: >-
+      Every bit source-derived. Reached directly it takes LLMWIRE_OPENAI_API_KEY
+      like the embeddings do; the first route through a gateway is the first
+      measurement of any of it.
+
+  # ---------------------------------------------------------------------------
+  # The full-size sibling. Same shape as gpt-5.4-mini, from its own model page
+  # (developers.openai.com/api/docs/models/gpt-5.4, read 2026-09-15); the two
+  # differ in what the page states differently, nothing else.
+  # ---------------------------------------------------------------------------
+  - id: gpt-5.4
+    display_name: GPT-5.4
+    endpoint: chat
+    wire_model_id: gpt-5.4
+    provider: openai
+    verified: source-derived
+
+    # NOT measured: as gpt-5.4-mini, the reasoning series caps output with
+    # max_completion_tokens.
+    max_tokens_param: max_completion_tokens
+
+    # NOT measured, model page 2026-09-15: "none (default), low, medium, high
+    # and xhigh". Unlike mini, the page names the default: none. So the model
+    # does NOT think when the field is omitted, and enabled_by_default is
+    # false; can_be_disabled is true because none is an accepted value.
+    reasoning:
+      supported: true
+      enabled_by_default: false
+      can_be_disabled: true
+      control: effort
+      effort_values: [none, low, medium, high, xhigh]
+      default_effort: none
+      # NOT measured, as gpt-5.4-mini. Deeper than this model's own default
+      # (none): Balanced asks for thinking, which omitting the field does not.
+      balanced: medium
+
+    # NOT measured on this model; the series' 400 on a non-default
+    # temperature, as gpt-5.4-mini.
+    temperature:
+      supported: true
+      forced_value: 1.0
+    top_p:
+      supported: true
+      forced_value: 1.0
+
+    # NOT measured, API reference.
+    tools:
+      supported: true
+      format: native
+      tool_choice_values: [auto, none, required]
+      supports_forced_choice: true
+      supports_parallel: true
+
+    # NOT measured, API reference.
+    output:
+      json_object: true
+      json_schema: true
+      strict_schema: true
+
+    # NOT measured, API reference.
+    streaming:
+      supported: true
+      needs_include_usage: true
+      accepts_stream_options: true
+
+    # NOT measured, model page: 1,050,000-token context, 128,000 maximum
+    # output. Prompts past 272K input tokens are billed at 2x input and 1.5x
+    # output for the whole session; the cost block below is the rate under it.
+    limits:
+      context: 1050000
+      max_output: 128000
+
+    # NOT measured, model page: text and image in, text out.
+    vision: true
+
+    # Model page, standard tier, under 272K input tokens. cache_write 0 as for
+    # mini. Behind a gateway this block is dropped (Profile.resolve).
+    cost:
+      input: 2.50
+      cache_read: 0.25
+      cache_write: 0
+      output: 15.00
+      source_url: https://developers.openai.com/api/docs/models/gpt-5.4
+      verified_on: 2026-09-15
+
+    notes: >-
+      Every bit source-derived, as gpt-5.4-mini. The one fact the page states
+      that mini's does not: the default effort is none, so an omitted field
+      means no thinking.
+
+  # ---------------------------------------------------------------------------
+  # gpt-5.5, from its model page (developers.openai.com/api/docs/models/gpt-5.5,
+  # read 2026-09-15). Same shape as gpt-5.4; the page names medium as the
+  # default effort, so this one thinks when the field is omitted.
+  # ---------------------------------------------------------------------------
+  - id: gpt-5.5
+    display_name: GPT-5.5
+    endpoint: chat
+    wire_model_id: gpt-5.5
+    provider: openai
+    verified: source-derived
+
+    # NOT measured: the reasoning series caps output with
+    # max_completion_tokens.
+    max_tokens_param: max_completion_tokens
+
+    # NOT measured, model page 2026-09-15: "none, low, medium (default), high
+    # and xhigh". none is accepted, so it can be told not to think.
+    reasoning:
+      supported: true
+      enabled_by_default: true
+      can_be_disabled: true
+      control: effort
+      effort_values: [none, low, medium, high, xhigh]
+      default_effort: medium
+      # NOT measured, as gpt-5.4-mini: equal to the documented default.
+      balanced: medium
+
+    # NOT measured on this model; the series' 400 on a non-default
+    # temperature, as gpt-5.4.
+    temperature:
+      supported: true
+      forced_value: 1.0
+    top_p:
+      supported: true
+      forced_value: 1.0
+
+    # NOT measured, API reference.
+    tools:
+      supported: true
+      format: native
+      tool_choice_values: [auto, none, required]
+      supports_forced_choice: true
+      supports_parallel: true
+
+    # NOT measured, API reference.
+    output:
+      json_object: true
+      json_schema: true
+      strict_schema: true
+
+    # NOT measured, API reference.
+    streaming:
+      supported: true
+      needs_include_usage: true
+      accepts_stream_options: true
+
+    # NOT measured, model page: 1,050,000-token context, 128,000 maximum
+    # output. Past 272K input tokens the session bills 2x input, 1.5x output.
+    limits:
+      context: 1050000
+      max_output: 128000
+
+    # NOT measured, model page: text and image in, text out.
+    vision: true
+
+    # Model page, standard tier, under 272K input tokens. cache_write 0 as for
+    # the rest of the series. Behind a gateway this block is dropped.
+    cost:
+      input: 5.00
+      cache_read: 0.50
+      cache_write: 0
+      output: 30.00
+      source_url: https://developers.openai.com/api/docs/models/gpt-5.5
+      verified_on: 2026-09-15
+
+    notes: >-
+      Every bit source-derived. Thinks at medium unless told otherwise, so a
+      caller with a tight output cap sends none or raises the cap.
+
+  # ---------------------------------------------------------------------------
+  # gpt-6.1-sol, from its model page (developers.openai.com/api/docs/models/
+  # gpt-6.1-sol, read 2026-10-14) and the pricing page. A new series, so
+  # nothing is carried from gpt-5.x without saying so. Two breaks from the
+  # gpt-5.x shape: thinking cannot be switched off, and tools need the
+  # Responses protocol.
+  #
+  # MEASURED 2026-10-19 through LiteLLM 1.105.1 -> Azure Switzerland North
+  # (`gpt-6.1-sol-2026-09-29`, upstream /openai/v1/responses?api-version=
+  # preview), the route via LLMWIRE_LITELLM_MODELS. Chat Completions with a
+  # tool refused: "Function tools with reasoning_effort are not supported for
+  # ai-gateway-gpt-6.1-sol in /v1/chat/completions. To use function tools, use
+  # /v1/responses or set reasoning_effort to 'none'." (param reasoning_effort,
+  # code "400"). So this profile speaks Responses, where tools and reasoning
+  # work together and the encrypted reasoning is replayed across tool rounds
+  # (responses.go head comment). Not probed against api.openai.com directly;
+  # the model page agrees: "Use the Responses API for tool calling."
+  # ---------------------------------------------------------------------------
+  - id: gpt-6.1-sol
+    display_name: GPT-6.1 Sol
+    endpoint: chat
+    wire_api: responses
+    wire_model_id: gpt-6.1-sol
+    provider: openai
+    verified: source-derived
+
+    # The Responses protocol's only cap spelling. MEASURED: echoed back as
+    # max_output_tokens 4000.
+    max_tokens_param: max_output_tokens
+
+    # NOT measured, model page 2026-10-14: "`reasoning.effort` supports `low`,
+    # `medium` (default), `high`, `xhigh`, and `max`." and "The `none` and
+    # `minimal` reasoning efforts are not supported." So it always thinks:
+    # ReasoningMinimal resolves to low, ReasoningOff is refused. MEASURED: high
+    # and low accepted on /responses; a trivial prompt reports
+    # reasoning_tokens 0 even at high, an arithmetic one 34.
+    reasoning:
+      supported: true
+      enabled_by_default: true
+      can_be_disabled: false
+      control: effort
+      effort_values: [low, medium, high, xhigh, max]
+      default_effort: medium
+      # NOT measured, a choice: the documented default, as on gpt-5.x.
+      # overhead ABSENT: DefaultReasoningOverhead applies.
+      balanced: medium
+
+    # temperature and top_p ABSENT: this page says nothing about either, and
+    # gpt-5.x's forced_value 1.0 is not carried across a series boundary. A
+    # caller sending either is refused in plan until a probe reads the shape.
+    # (Azure echoes temperature 1.0, top_p 0.98 unasked; not a measurement of
+    # what it accepts.)
+
+    # MEASURED via the route above, each with a prompt that never asked for a
+    # tool where that matters: "Say hello." under tool_choice required and
+    # under the forced {"type":"function","name":"get_weather"} both returned
+    # a get_weather call; none returned prose although the prompt demanded
+    # the tool; two tools in one turn returned two function_call items.
+    tools:
+      supported: true
+      format: native
+      tool_choice_values: [auto, required, none]
+      supports_forced_choice: true
+      supports_parallel: true
+
+    # MEASURED via the route above: text.format json_schema with strict true
+    # accepted and the reply parsed. json_object NOT measured, model page.
+    output:
+      json_object: true
+      json_schema: true
+      strict_schema: true
+
+    # MEASURED via the route above: streams, usage on response.completed
+    # whatever the request says; Responses has no stream_options.
+    streaming:
+      supported: true
+      needs_include_usage: false
+      accepts_stream_options: false
+
+    # NOT measured, model page: 1,050,000-token context, 128,000 maximum
+    # output, "maximum input: 922,000". Long-context pricing is the tier in
+    # the cost block.
+    limits:
+      context: 1050000
+      max_output: 128000
+
+    # NOT measured, model page: text and image in, text out.
+    vision: true
+
+    # Pricing page, standard tier, short context (<= 272K input tokens):
+    # 2.00 / 0.10 cached / 2.50 cache write / 10.00. cache_write is 0 HERE,
+    # not 2.50, per the usage.go head comment: no shipped cache_write rate is
+    # non-zero before a probe reads whether cache_write_tokens sits inside or
+    # beside prompt_tokens. Either way 0 UNDER-reports: inside, written tokens
+    # price at the input rate, 0.50 per million short; beside, they price at
+    # nothing, 2.50 short. 2.50 would over-report by 2.00 if inside. Behind a
+    # gateway this block is dropped.
+    cost:
+      input: 2.00
+      cache_read: 0.10
+      cache_write: 0
+      output: 10.00
+      # Model page: "Prompts with more than 272K input tokens are priced at
+      # 2x input and cache rates and 1.5x output for the full request."
+      # Pricing page long-context row 4.00 / 0.20 / 5.00 / 15.00 agrees.
+      tiers:
+        - name: long-context
+          min_input_tokens: 272001
+          multiplier_permille: 2000
+          output_multiplier_permille: 1500
+      source_url: https://developers.openai.com/api/docs/pricing
+      verified_on: 2026-10-14
+
+    notes: >-
+      Tools, structured output and streaming measured via LiteLLM/Azure;
+      the rest source-derived. Always thinks (low at the least, medium by
+      default) and cannot be told not to, so a caller with a tight output cap
+      raises the cap. MaxAnswerTokens adds DefaultReasoningOverhead (1024), not
+      a measured figure, and at xhigh or max that is likely short: expect
+      finish_reason length with an empty answer until an overhead is measured.
+      Speaks the Responses protocol (wire_api: responses), the only one on
+      which it takes tools while thinking; a tool loop appends
+      resp.Assistant() so the encrypted reasoning goes back each round. No
+      stop sequences on that protocol. Behind LiteLLM 1.105.1 the stream is
+      faked (nothing until the answer is complete) unless the gateway catalog
+      aliases azure/<deployment>; there, size the header bound to the call.
+      responses.go head comment.
+
+  # ---------------------------------------------------------------------------
+  # Anthropic, its own API (provider anthropic, wire_api messages). Sources:
+  # the API reference and the claude-api skill reference for claude-opus-5-5
+  # (cached 2026-10-06), and the pricing page read 2026-10-26. MEASURED
+  # 2026-10-26 on api.anthropic.com (eval_messages_test.go, FINDINGS.md).
+  # ---------------------------------------------------------------------------
+  - id: claude-opus-5-5
+    display_name: Claude Opus 5.5
+    endpoint: chat
+    wire_api: messages
+    wire_model_id: claude-opus-5-5
+    provider: anthropic
+    verified: measured
+
+    # The protocol's only cap spelling, and required on every request: an
+    # uncapped request goes out at limits.max_output. MEASURED: a
+    # non-streamed call at 128000 accepted.
+    max_tokens_param: max_tokens
+
+    # MEASURED: low, medium, high, xhigh and max accepted; none and minimal a
+    # 400 ("Input should be 'low', 'medium', 'high', 'xhigh' or 'max'");
+    # thinking.type disabled and enabled (budget_tokens) both a 400: "Use
+    # \"thinking.type.adaptive\" and \"output_config.effort\" to control
+    # thinking behavior." ReasoningMinimal resolves to low. default_effort NOT
+    # measured, skill reference.
+    reasoning:
+      supported: true
+      enabled_by_default: true
+      can_be_disabled: false
+      control: effort
+      effort_values: [low, medium, high, xhigh, max]
+      default_effort: medium
+      # NOT measured, a choice: the documented default.
+      balanced: medium
+      # overhead ABSENT, and DefaultReasoningOverhead (1024) is far short at
+      # high and above: MEASURED, a counting problem at high thought through
+      # the whole 16000-token cap and returned no answer.
+
+    # MEASURED: temperature and top_p each a 400, "Extra inputs are not
+    # permitted"; refused on every model under anthropic-version 2026-10-21.
+    temperature:
+      supported: false
+    top_p:
+      supported: false
+
+    # MEASURED: tool_choice any and tool a 400, "tool_choice: type \"tool\"
+    # and \"any\" are not supported for this model.", so required and a named
+    # function relax to auto with a warning. The tool loop with a thinking
+    # replay measured accepted, so was a hand-built tool turn with no thinking
+    # block. Parallel calls NOT measured.
+    tools:
+      supported: true
+      format: native
+      tool_choice_values: [auto, none]
+      supports_forced_choice: false
+      supports_parallel: true
+
+    # MEASURED: output_config.format json_schema, the reply parsed. Constrained
+    # decoding, enforced whatever strict says (skill reference). No
+    # json_object mode.
+    output:
+      json_object: false
+      json_schema: true
+      strict_schema: true
+
+    # MEASURED: usage on message_start and message_delta unasked; no
+    # stream_options on this protocol. A long think streams summarized
+    # thinking_delta frames at most 4.8s apart, with one ping in 2m40s.
+    streaming:
+      supported: true
+      needs_include_usage: false
+      accepts_stream_options: false
+
+    # MEASURED, the models listing: max_input_tokens 1000000, max_tokens 128000.
+    limits:
+      context: 1000000
+      max_output: 128000
+
+    # NOT measured, model overview: text and image in, text out.
+    vision: true
+
+    # MEASURED: a request ending on an assistant turn is a 400, "This model
+    # does not support assistant message prefill. The conversation must end
+    # with a user message." One opening on an assistant turn was accepted.
+    assistant_prefill: false
+
+    # Pricing page 2026-10-26: base input 4, 5-minute cache write 5 (1.25x),
+    # 1-hour cache write 8 (2x), cache read 0.20 (0.05x), output 20. The full
+    # 1M window at these rates, no long-context tier. MEASURED containment:
+    # cache writes and reads sit beside input_tokens (FINDINGS.md), so the
+    # write lane is priced on top, never subtracted. cache_write is the
+    # 5-minute rate: llmwire sends no cache_control, and a call that wrote to
+    # the 1-hour cache through ExtraBody is Unpriced rather than under-priced
+    # (pricing.go). speed "fast" (2x) and inference_geo "us" (1.1x) are
+    # refused in ExtraBody for the same reason.
+    cost:
+      input: 4.00
+      cache_read: 0.20
+      cache_write: 5.00
+      output: 20.00
+      source_url: https://platform.claude.com/docs/en/about-claude/pricing
+      verified_on: 2026-10-26
+
+    finish_reasons_extra: [content_filter, pause_turn, model_context_window_exceeded]
+
+    notes: >-
+      Speaks Anthropic's Messages protocol (wire_api: messages); the caller's
+      API is unchanged. Always thinks, medium by default, and cannot be told
+      not to; thinking is requested as a summary so Reasoning carries text and
+      a long think streams. At high and above a think can fill the whole cap:
+      MaxAnswerTokens adds only DefaultReasoningOverhead, so expect
+      finish_reason length with no answer on a hard prompt until an overhead
+      is measured. A tool loop appends resp.Assistant() so the signed
+      thinking blocks go back each round. No forced tool choice, no
+      temperature or top_p, no json_object. Caching is opt-in through
+      ExtraBody cache_control. messages.go head comment.

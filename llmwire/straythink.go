@@ -1,0 +1,45 @@
+package llmwire
+
+import "strings"
+
+// The close tag, and the open tag that makes a block of it.
+const (
+	strayCloseTag = "</think>"
+	thinkOpenTag  = "<think>"
+)
+
+// leakCanApply reports whether a reply to req can carry the leak at all. It
+// was observed with thinking switched off, where no reasoning block belongs in
+// content.
+func leakCanApply(req ChatRequest) bool {
+	_, off := req.Reasoning.(reasoningOff)
+	return off && req.ResponseFormat.text()
+}
+
+// cutStrayCloseTag splits content at the FIRST close tag when it ends a
+// draft: what follows is the answer, what precedes it joins reasoning, so a
+// caller reading the reasoning channel still sees it and one parsing the
+// answer does not. The first, not the last: an answer that quotes the tag
+// after the leak keeps its opening. An open tag anywhere but the very start
+// means the pair is quoted text, not a leak, and content is left alone.
+func cutStrayCloseTag(content, reasoning string) (string, string, bool) {
+	i := strings.Index(content, strayCloseTag)
+	if i < 0 {
+		return content, reasoning, false
+	}
+	head := strings.TrimSpace(content[:i])
+	// After cutting a leading open tag, any open tag still in the draft is
+	// quoted text. When there was no leading tag the draft IS the head, so
+	// this one test covers both.
+	draft, _ := strings.CutPrefix(head, thinkOpenTag)
+	if strings.Contains(draft, thinkOpenTag) {
+		return content, reasoning, false
+	}
+	if draft = strings.TrimSpace(draft); draft != "" {
+		if reasoning != "" {
+			reasoning += "\n"
+		}
+		reasoning += draft
+	}
+	return strings.TrimSpace(content[i+len(strayCloseTag):]), reasoning, true
+}

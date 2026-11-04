@@ -1,0 +1,59 @@
+---
+title: "3 surprising findings from our 2024 Global DevSecOps Survey"
+author: "Dave Steer"
+published: "2024-06-25T00:00:00Z"
+site: "GitLab"
+language: "en-us"
+---
+
+This year’s [survey of more than 5,000 DevSecOps professionals worldwide](https://about.gitlab.com/developer-survey/) suggests that as organizations adopt new technologies such as AI, they're reevaluating investment priorities and looking more critically at how they can improve the developer experience. Here's a look at three of the more surprising results from this year's survey, and what they could mean for software development, operations, and security teams in 2024 and beyond.
+
+
+## 1\. AI shines a light on cumbersome toolchains
+
+This year, we looked specifically at how AI might impact DevSecOps teams’ attitudes toward their existing toolchains, and the findings were somewhat surprising. We know AI can help teams simplify software development, but our survey showed that respondents currently using AI might be more frustrated with their toolchains than those not using AI.
+
+
+Nearly three-quarters (74%) of respondents whose organizations are currently using AI for software development said they wanted to consolidate their toolchain, compared to 57% of those who aren’t using AI. However, there wasn’t a significant difference between the two groups in the number of tools respondents reported using. In other words, respondents currently using AI weren’t using more tools but still felt a stronger need to consolidate their toolchain.
+
+
+Why would AI accelerate the desire to consolidate? One explanation could be that different point solutions running different AI models create unmanageable (and unmeasurable) chaos in the software development lifecycle — and that is shedding new light on organizations’ already cumbersome and counterproductive toolchains. As organizations increase their AI investments, there will be a greater need to improve efficiency by consolidating and simplifying toolchain sprawl. Teams get more value from AI when toolchains are smaller, making integrating AI across the entire software development lifecycle easier.
+
+
+One survey respondent identified “too many tools (including AI tools) and context switching” as the biggest challenges in software development in 2024, while another pointed to the “complexity of fragmented landscape of tools across the board.”
+
+
+Another respondent highlighted AI’s opportunities to help teams address toolchain challenges: “AI is growing fast, and our current toolchain can be massively improved with AI integrations. We need to train team members better, so they know how to use AI effectively in their daily work.”
+
+
+## 2\. AI speeds up developer onboarding — but organizations still have concerns
+
+Along with the increase in the number of tools teams use, we noted a significant increase in developer onboarding times in this year’s survey. In 2024, 70% of respondents told us it takes developers in their organization more than a month to onboard and become productive, up from 66% in 2023.
+
+
+While it’s not surprising that AI-powered [chat assistants](https://about.gitlab.com/blog/2024/04/18/gitlab-duo-chat-now-generally-available/) and [code suggestions](https://about.gitlab.com/blog/2024/06/11/top-tips-for-efficient-ai-powered-code-suggestions-with-gitlab-duo/), can help developers onboard faster, the effect we observed in our survey was dramatic: Respondents who use AI for software development were much more likely to say that developer onboarding typically takes less than a month.
+
+
+Despite AI’s clear benefits for developer experience, respondents expressed several concerns about its rapid adoption. Over half (55%) of respondents said introducing AI into the software development lifecycle is risky, and 49% said they fear AI will replace their current role within the next five years.
+
+
+Rachel Stephens, senior analyst at industry analyst firm RedMonk, shared her perspective on these findings: “There is a component of psychological safety and team culture that impacts how people feel about AI. Individuals may be concerned about the security or privacy implications of AI, but their sense of unpreparedness may also stem from a feeling that AI has personal risk to their livelihoods.”
+
+
+Our take is that the value of AI lies in its ability to automate repetitive tasks and behind-the-scenes optimization, empowering teams to focus on high-level problem-solving, innovation, and value creation. It’s about supplementing — not replacing — the human element of software development. One survey respondent summed this up as follows: “Fostering and maintaining creativity while leaning into AI is a challenge we face. We must remember that AI is simply one tool creative people use to cut out the junk that would otherwise impede productivity. It doesn’t replace human creativity.”
+
+
+## 3\. The cloud becomes table stakes
+
+In our survey, cloud computing has consistently ranked as a top IT investment priority over the past several years. In 2022, cloud computing ranked number two, after security, and in 2023 it took the top spot — not surprising, given increased pressure on organizations to undergo [digital transformation](https://about.gitlab.com/blog/2023/05/16/lockheed-martin-aws-gitlab/).
+
+
+In 2024, though, cloud computing saw a sharp decrease, ranking at number five. However, at the same time, it’s clear that the cloud continues to be important. In fact, we saw a significant increase in the number of respondents who said they are running 50% or more of their apps in the cloud. This suggests that while the cloud is still mission-critical for many businesses, it’s now “table stakes” — and at the same time, the list of priorities for technical teams and IT leaders continues to grow.
+
+
+According to RedMonk’s Stephens, “We are in a cash-constrained financial environment, and people are having to make prioritization decisions between technology investments — meaning organizations could be reallocating some, but not all, of their digital transformation budgets to things like AI.”
+
+
+## Explore this year’s report
+
+Read the full [2024 Global DevSecOps Report](https://about.gitlab.com/developer-survey/) for more insights on AI, security, developer experience, and more.
