@@ -1,0 +1,665 @@
+package llmwire
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestRawStream_HappyPath(t *testing.T) {
+	srv := sseServer(t, []string{
+		`data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`,
+		doneFrame,
+	})
+	c := New(Config{BaseURL: srv.URL})
+	res, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Content != "hello" {
+		t.Errorf("content = %q, want hello", res.Content)
+	}
+	if got := res.Usage.Input.Total; got == nil || *got != 3 {
+		t.Errorf("usage not captured: %v", deref(got))
+	}
+}
+
+// An empty API key must send NO Authorization header rather than an empty one,
+// which some gateways reject outright.
+func TestRawStream_EmptyAPIKeySendsNoAuthorizationHeader(t *testing.T) {
+	srv := sseServer(t, []string{stopFrame})
+
+	c := New(Config{BaseURL: srv.URL})
+	if _, err := c.RawStream(context.Background(), []byte(`{}`), nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	seen := srv.last()
+	if seen == nil {
+		t.Fatal("handler never ran")
+	}
+	if _, hadAuth := seen.Header["Authorization"]; hadAuth {
+		t.Error("an empty APIKey must not produce an Authorization header")
+	}
+}
+
+func TestRawStream_SendsConfiguredHeaders(t *testing.T) {
+	srv := sseServer(t, []string{stopFrame})
+
+	c := New(Config{
+		BaseURL:   srv.URL,
+		APIKey:    "secret",
+		UserAgent: "custom/1.0",
+		Headers:   map[string]string{"X-Session-Id": "ses_abc"},
+	})
+	if _, err := c.RawStream(context.Background(), []byte(`{}`), nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := srv.last().Header
+	if got.Get("Authorization") != "Bearer secret" {
+		t.Errorf("Authorization = %q", got.Get("Authorization"))
+	}
+	if got.Get("User-Agent") != "custom/1.0" {
+		t.Errorf("User-Agent = %q", got.Get("User-Agent"))
+	}
+	if got.Get("X-Session-Id") != "ses_abc" {
+		t.Errorf("X-Session-Id = %q", got.Get("X-Session-Id"))
+	}
+	if got.Get("Accept") != "text/event-stream" {
+		t.Errorf("Accept = %q", got.Get("Accept"))
+	}
+	// Accept-Encoding is deliberately left unset so net/http keeps negotiating
+	// and decompressing gzip itself. Setting it by hand hands us a compressed
+	// body to decode mid-stream.
+	if _, set := got["Accept-Encoding"]; set && got.Get("Accept-Encoding") != "gzip" {
+		t.Errorf("Accept-Encoding = %q, want unset or net/http's own gzip", got.Get("Accept-Encoding"))
+	}
+}
+
+// The base URL must not already end in the route.
+func TestRawStream_AppendsRouteToBaseURL(t *testing.T) {
+	srv := sseServer(t, []string{stopFrame})
+
+	// A trailing slash on the base must not double up.
+	c := New(Config{BaseURL: srv.URL + "/"})
+	if _, err := c.RawStream(context.Background(), []byte(`{}`), nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if path := srv.last().URL.Path; path != "/chat/completions" {
+		t.Errorf("path = %q, want /chat/completions", path)
+	}
+}
+
+func TestRawStream_ErrorStatusIsDecoded(t *testing.T) {
+	srv := jsonServer(t, http.StatusBadRequest, `{"error":{"message":"thinking cannot be disabled","code":"1210"}}`)
+
+	c := New(Config{BaseURL: srv.URL})
+	_, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error is %T, want *APIError", err)
+	}
+	if apiErr.Code != "1210" {
+		t.Errorf("code = %q, want 1210", apiErr.Code)
+	}
+	if apiErr.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", apiErr.StatusCode)
+	}
+}
+
+// LiteLLM puts code after a message that embeds the upstream text, so a long
+// message pushes the code past the field cap. Cutting the body there before
+// decoding loses the one field callers dispatch on.
+func TestRawPost_CodeAfterALongMessageSurvives(t *testing.T) {
+	long := strings.Repeat("m", 3*maxErrorBody)
+	srv := jsonServer(t, http.StatusBadRequest, `{"error":{"message":"`+long+`","code":"1210"}}`)
+
+	_, _, err := New(Config{BaseURL: srv.URL}).RawPost(context.Background(), "/chat/completions", []byte(`{}`))
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "1210" {
+		t.Fatalf("err = %v, want an *APIError with code 1210", err)
+	}
+	if len(apiErr.Message) > maxErrorBody+len("…(truncated)") {
+		t.Errorf("message length %d, want bounded to %d", len(apiErr.Message), maxErrorBody)
+	}
+}
+
+// A 429 carries Retry-After when the endpoint sends one. The library parses it
+// and stops there: it never retries on its own, because a library-level retry
+// turns a transient outage into a permanent failure for a whole job queue.
+func TestRawStream_RateLimitCarriesRetryAfter(t *testing.T) {
+	srv := jsonServer(t, http.StatusTooManyRequests, `{"error":{"message":"slow down","code":"1302"}}`,
+		reply{header: map[string]string{"Retry-After": "17"}})
+
+	c := New(Config{BaseURL: srv.URL})
+	_, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("error is %T, want *RateLimitError", err)
+	}
+	if rl.RetryAfter != 17*time.Second {
+		t.Errorf("RetryAfter = %v, want 17s", rl.RetryAfter)
+	}
+	if !errors.Is(err, ErrRateLimited) {
+		t.Error("should match ErrRateLimited")
+	}
+}
+
+// An error body carrying a credential must not reach the caller's log.
+func TestRawStream_ErrorBodyIsRedacted(t *testing.T) {
+	// Assembled, not a literal — see fakeKey in errors_test.go.
+	key := fakeKey("sk", "abcdefghijklmnopqrstuvwxyz01")
+	srv := jsonServer(t, http.StatusUnauthorized, `{"error":{"message":"invalid key `+key+`"}}`)
+
+	c := New(Config{BaseURL: srv.URL})
+	_, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), key) {
+		t.Errorf("error leaked the key: %v", err)
+	}
+}
+
+// The header bound and the idle bound mean different things, and a failure has
+// to say which one gave up — that naming is the deliverable of splitting them.
+func TestRawStream_HeaderStallNamesItsBound(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := New(Config{BaseURL: srv.URL, HeaderTimeout: 50 * time.Millisecond})
+	_, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("expected a stall error")
+	}
+	if !strings.Contains(err.Error(), stallHeaders) {
+		t.Errorf("error = %v, want it to name %q", err, stallHeaders)
+	}
+}
+
+// Headers arrive promptly, then the stream goes silent. That is a different
+// failure from the endpoint never answering, and must be named differently.
+func TestRawStream_IdleStallNamesItsBound(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"start\"},\"finish_reason\":null}]}\n\n"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := New(Config{BaseURL: srv.URL, HeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Millisecond})
+	_, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("expected a stall error")
+	}
+	if !strings.Contains(err.Error(), stallIdle) {
+		t.Errorf("error = %v, want it to name %q", err, stallIdle)
+	}
+}
+
+// Comment lines prove the connection is alive but say nothing about the model
+// making progress. They deliberately do NOT re-arm the idle guard, or a
+// heartbeat-emitting upstream masks a model that has stalled completely.
+func TestRawStream_KeepaliveCommentsDoNotReArmTheIdleGuard(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		fl.Flush()
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n"))
+		fl.Flush()
+		// Ping forever, send no further data frame.
+		for {
+			select {
+			case <-release:
+				return
+			case <-r.Context().Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+				if _, err := w.Write([]byte(": ping\n\n")); err != nil {
+					return
+				}
+				fl.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := New(Config{BaseURL: srv.URL, HeaderTimeout: 5 * time.Second, IdleTimeout: 80 * time.Millisecond})
+	start := time.Now()
+	_, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("expected the idle guard to fire despite the keepalives")
+	}
+	if !strings.Contains(err.Error(), stallIdle) {
+		t.Errorf("error = %v, want it to name %q", err, stallIdle)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("took %v — the keepalives appear to be re-arming the guard", elapsed)
+	}
+}
+
+// A stream that stays alive forever without finishing still has to end.
+func TestRawStream_CallCapNamesItself(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		fl.Flush()
+		for {
+			select {
+			case <-release:
+				return
+			case <-r.Context().Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+				if _, err := w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\".\"},\"finish_reason\":null}]}\n\n")); err != nil {
+					return
+				}
+				fl.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := New(Config{
+		BaseURL:       srv.URL,
+		HeaderTimeout: 5 * time.Second,
+		IdleTimeout:   5 * time.Second,
+		CallTimeout:   120 * time.Millisecond,
+	})
+	_, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("expected the call cap to fire")
+	}
+	if !strings.Contains(err.Error(), "call cap") {
+		t.Errorf("error = %v, want it to name the call cap", err)
+	}
+}
+
+// A caller cancelling is not a stall, and must not be reported as one.
+func TestRawStream_ParentCancellationIsNotReportedAsAStall(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	c := New(Config{BaseURL: srv.URL, HeaderTimeout: 10 * time.Second, CallTimeout: 10 * time.Second})
+	_, err := c.RawStream(ctx, []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), stallHeaders) || strings.Contains(err.Error(), "call cap") {
+		t.Errorf("error = %v, want the caller's own cancellation, not a bound", err)
+	}
+}
+
+// Nor is a cancel after the headers an endpoint that did not finish: the body
+// read fails because the caller stopped it, so ErrMalformedResponse is wrong.
+func TestChatStream_ParentCancellationMidStreamIsNotMalformed(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + `{"choices":[{"delta":{"content":"hi"}}]}` + "\n\n"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := New(Config{BaseURL: srv.URL, IdleTimeout: 10 * time.Second, CallTimeout: 10 * time.Second})
+	stream, _, err := c.ChatStream(ctx, ChatRequest{Model: "mimo-v2.6-flash", Messages: []Message{User("x")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if !stream.Next() {
+		t.Fatalf("no first event: %v", stream.Err())
+	}
+	cancel()
+	for stream.Next() {
+	}
+	err = stream.Err()
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrMalformedResponse) {
+		t.Errorf("err = %v, want context.Canceled and not ErrMalformedResponse", err)
+	}
+}
+
+// --- RawPost -----------------------------------------------------------------
+
+func TestRawPost_ReturnsBodyAndHeaders(t *testing.T) {
+	// A gateway reports per-call spend and the real deployment name in
+	// headers and nowhere else, which is why RawPost hands them back.
+	srv := jsonServer(t, http.StatusOK, `{"data":[{"index":0,"embedding":[0.1,0.2]}]}`, reply{header: map[string]string{
+		"x-litellm-response-cost": "1.23e-05",
+		"x-litellm-model-name":    "azure/gpt-5.4",
+	}})
+
+	c := New(Config{BaseURL: srv.URL})
+	raw, hdr, err := c.RawPost(context.Background(), "/embeddings", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var decoded struct {
+		Data []struct {
+			Index int `json:"index"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded.Data) != 1 {
+		t.Errorf("got %d embeddings, want 1", len(decoded.Data))
+	}
+	if hdr.Get("x-litellm-model-name") != "azure/gpt-5.4" {
+		t.Error("response headers were not returned")
+	}
+}
+
+func TestRawPost_ErrorStatusIsDecodedAndHeadersStillReturned(t *testing.T) {
+	srv := jsonServer(t, http.StatusBadRequest, `{"error":{"message":"bad model","code":"1211"}}`,
+		reply{header: map[string]string{"x-litellm-call-id": "abc123"}})
+
+	c := New(Config{BaseURL: srv.URL})
+	_, hdr, err := c.RawPost(context.Background(), "/embeddings", []byte(`{}`))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	// The call id is how a streamed call's cost is looked up afterwards, so it
+	// must survive a failure.
+	if hdr.Get("x-litellm-call-id") != "abc123" {
+		t.Error("headers must still be returned on an error response")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "1211" {
+		t.Errorf("error = %v", err)
+	}
+}
+
+// --- redaction by value and by URL -------------------------------------------
+
+// The configured key is not necessarily a shape Redact knows: a token-plan host
+// or a self-hosted gateway issues whatever it likes. An upstream that echoes the
+// Authorization header must not put that value into the error, on any path.
+func TestErrors_TheConfiguredKeyNeverAppearsWhateverItsShape(t *testing.T) {
+	const key = "plan-key-of-no-known-shape"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/embeddings") {
+			// A 200 carrying an error object, the embeddings way.
+			_, _ = w.Write([]byte(`{"error":{"message":"refused ` + r.Header.Get("Authorization") + `"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("upstream refused: " + r.Header.Get("Authorization")))
+	}))
+	defer srv.Close()
+	c := New(Config{BaseURL: srv.URL, APIKey: key})
+
+	_, _, err := c.Chat(context.Background(), ChatRequest{Model: "mimo-v2.6-flash", Messages: []Message{User("x")}})
+	if err == nil || strings.Contains(err.Error(), key) {
+		t.Fatalf("Chat error = %v, the key must not be quoted", err)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || !strings.Contains(apiErr.Message, "[REDACTED]") {
+		t.Errorf("Chat error = %v, want the key replaced inside the APIError message", err)
+	}
+
+	_, _, err = c.Embed(context.Background(), EmbedRequest{Model: "text-embedding-3-small", Inputs: []string{"x"}})
+	if err == nil || strings.Contains(err.Error(), key) {
+		t.Fatalf("Embed error = %v, the key must not be quoted", err)
+	}
+}
+
+// Two ways the value pass could miss, both from the review of this change:
+// the shape pass eating the middle of a key that contains an sk- run, so the
+// value is no longer in the text; and the read cut landing inside the key,
+// so only its head is in the buffer. And the streaming error frame, which is
+// parsed on another path than a status error.
+func TestErrors_TheKeyIsStrippedBeforeTheShapePassAndAcrossTheCut(t *testing.T) {
+	// Assembled at runtime: a literal of this shape is exactly what
+	// ship check's secret scan refuses to let into the tree.
+	key := "gw-" + "sk" + "-" + strings.Repeat("a", 24) + "-tail"
+	filler := strings.Repeat("x", maxErrorRead-10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		switch {
+		case r.Header.Get("Accept") == "text/event-stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(`data: {"error":{"message":"refused ` + auth + `","type":"auth"}}` + "\n\n"))
+		case strings.Contains(r.URL.RawQuery, "straddle"):
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(filler + auth))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"bad key ` + auth + `"}}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(Config{BaseURL: srv.URL, APIKey: key})
+	req := ChatRequest{Model: "mimo-v2.6-flash", Messages: []Message{User("x")}}
+
+	// A key with an sk- run in the middle: the shape pass alone would leave
+	// "gw-" and "-tail" around a [REDACTED].
+	_, _, err := c.Chat(context.Background(), req)
+	if err == nil || strings.Contains(err.Error(), "gw-") || strings.Contains(err.Error(), "-tail") {
+		t.Errorf("status error = %v, want the whole key gone, not just its sk- run", err)
+	}
+
+	// The same key straddling the read cap.
+	straddle := New(Config{BaseURL: srv.URL + "?straddle=1", APIKey: key})
+	_, _, err = straddle.Chat(context.Background(), req)
+	if err == nil || strings.Contains(err.Error(), "gw-sk") {
+		t.Errorf("straddling error = %v, want no head of the key left at the cut", err)
+	}
+
+	// The error frame inside a 200 stream.
+	stream, _, err := c.ChatStream(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	for stream.Next() {
+	}
+	err = stream.Err()
+	if err == nil || strings.Contains(err.Error(), "gw-") || strings.Contains(err.Error(), "-tail") {
+		t.Errorf("stream error = %v, want the whole key gone on the streaming path too", err)
+	}
+}
+
+// net/http puts the full URL, query string included, into every dial failure.
+// A base URL that carries its key there would otherwise reach the log through
+// the one error a caller always prints: "could not connect".
+func TestErrors_ADialFailureNamesTheHostNotTheURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	addr := srv.URL
+	srv.Close() // nothing listens any more
+
+	c := New(Config{BaseURL: addr + "/v1?api_key=querysecret"})
+
+	_, _, err := c.Chat(context.Background(), ChatRequest{Model: "mimo-v2.6-flash", Messages: []Message{User("x")}})
+	if err == nil {
+		t.Fatal("expected a dial failure")
+	}
+	if strings.Contains(err.Error(), "querysecret") {
+		t.Errorf("error = %v, the query string must not be quoted", err)
+	}
+	if !strings.Contains(err.Error(), addr) {
+		t.Errorf("error = %v, want scheme://host kept so an operator sees where it failed", err)
+	}
+	// The cause is still there for errors.Is: a net error, not a bare string.
+	var nerr interface{ Timeout() bool }
+	if !errors.As(err, &nerr) {
+		t.Errorf("error = %v, want the transport cause kept in the chain", err)
+	}
+
+	_, _, err = c.ChatStream(context.Background(), ChatRequest{Model: "mimo-v2.6-flash", Messages: []Message{User("x")}})
+	if err == nil || strings.Contains(err.Error(), "querysecret") || !strings.Contains(err.Error(), addr) {
+		t.Errorf("ChatStream error = %v, want the same trimming on the streaming path", err)
+	}
+}
+
+// --- config ------------------------------------------------------------------
+
+func TestNew_AppliesDefaults(t *testing.T) {
+	c := New(Config{BaseURL: "https://example.test"})
+	if c.header != DefaultHeaderTimeout || c.idle != DefaultIdleTimeout || c.cap != DefaultCallTimeout {
+		t.Errorf("bounds = %v/%v/%v, want the documented defaults", c.header, c.idle, c.cap)
+	}
+	if c.userAgent != DefaultUserAgent {
+		t.Errorf("user agent = %q", c.userAgent)
+	}
+	if c.Now().IsZero() {
+		t.Error("clock was not defaulted")
+	}
+}
+
+// The clock is injectable because cost depends on wall-clock time on endpoints
+// with off-peak pricing, and a test that only passes during a particular local
+// window is worse than no test.
+func TestNew_ClockIsInjectable(t *testing.T) {
+	fixed := time.Date(2026, 9, 12, 15, 0, 0, 0, time.UTC)
+	c := New(Config{BaseURL: "https://example.test", Now: func() time.Time { return fixed }})
+	if !c.Now().Equal(fixed) {
+		t.Errorf("Now() = %v, want the injected %v", c.Now(), fixed)
+	}
+}
+
+// http.Client.Timeout must never be set: it caps body reads too, so it would
+// cut a legitimately long stream mid-answer.
+func TestNew_DefaultHTTPClientHasNoWholeRequestTimeout(t *testing.T) {
+	c := New(Config{BaseURL: "https://example.test"})
+	if c.http.Timeout != 0 {
+		t.Errorf("http.Client.Timeout = %v, want 0 — it would truncate a long stream", c.http.Timeout)
+	}
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want *http.Transport", c.http.Transport)
+	}
+	// A backstop only, and deliberately LATER than every header-phase bound
+	// the guard arms: the two would otherwise race, and a transport win
+	// reports its own generic timeout instead of the named bound the split
+	// exists to provide. The largest such bound is the whole-call cap, which
+	// rawCall arms for the header phase because a non-streaming endpoint
+	// withholds headers until the answer is ready; and the setting applies on
+	// HTTP/2 too, so a backstop sized to the stream's header bound capped
+	// every non-streaming call at 90s.
+	if tr.ResponseHeaderTimeout != DefaultCallTimeout+headerBackstopHeadroom {
+		t.Errorf("ResponseHeaderTimeout = %v, want the call cap plus headroom (%v)",
+			tr.ResponseHeaderTimeout, DefaultCallTimeout+headerBackstopHeadroom)
+	}
+	if tr.ResponseHeaderTimeout <= DefaultCallTimeout {
+		t.Error("the transport backstop must fire after the whole-call cap, not with it")
+	}
+}
+
+// The backstop follows a configured cap, not the default: a caller who raises
+// CallTimeout for a slow non-streaming model must not be cut at the default
+// plus headroom by the transport.
+func TestNew_TransportBackstopFollowsTheConfiguredCallCap(t *testing.T) {
+	c := New(Config{BaseURL: "https://example.test", CallTimeout: 45 * time.Minute})
+	tr := c.http.Transport.(*http.Transport)
+	if tr.ResponseHeaderTimeout != 45*time.Minute+headerBackstopHeadroom {
+		t.Errorf("ResponseHeaderTimeout = %v, want 45m plus headroom", tr.ResponseHeaderTimeout)
+	}
+}
+
+// Mutating the caller's header map after New must not change what is sent.
+func TestNew_CopiesTheHeaderMap(t *testing.T) {
+	h := map[string]string{"X-A": "1"}
+	c := New(Config{BaseURL: "https://example.test", Headers: h})
+	h["X-A"] = "mutated"
+	if c.headers["X-A"] != "1" {
+		t.Error("New must copy the header map")
+	}
+}
+
+// A stream read to its end releases its contexts without waiting for Close:
+// the call-cap timer otherwise stays registered on the parent until it fires.
+func TestChatStream_DrainedStreamReleasesItsContexts(t *testing.T) {
+	srv := sseServer(t, frameLines(contentDelta("hi")))
+	stream, _, err := New(Config{BaseURL: srv.URL}).ChatStream(context.Background(),
+		ChatRequest{Model: "mimo-v2.6-flash", Messages: []Message{User("x")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for stream.Next() {
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if stream.callCtx.Err() == nil {
+		t.Error("the call context is still live after the stream ended")
+	}
+}
+
+// scrub is the last line of redaction: an error built where no redactor was
+// in reach, whose text carries the key by value, is wrapped so the text is
+// clean and errors.Is still sees the original.
+func TestClient_ScrubStripsTheKeyByValueAndKeepsTheChain(t *testing.T) {
+	const key = "plain-token-with-no-known-shape"
+	c := New(Config{BaseURL: "https://example.test", APIKey: key})
+	cause := errors.New("upstream echoed Authorization: Bearer " + key)
+	err := c.scrub(fmt.Errorf("wrapped: %w", cause))
+	if strings.Contains(err.Error(), key) {
+		t.Fatalf("scrubbed error still carries the key: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Errorf("scrubbed error = %q, want the key replaced by [REDACTED]", err.Error())
+	}
+	if !errors.Is(err, cause) {
+		t.Error("scrub must keep the original as its cause")
+	}
+	// Nothing to scrub: the error comes back as given, not wrapped. Identity
+	// is the assertion, so errors.Is would pass for exactly the rewrap this
+	// checks against.
+	clean := errors.New("no key here")
+	if got := c.scrub(clean); got != clean { //nolint:errorlint // identity, see above
+		t.Errorf("scrub rewrapped a clean error: %v", got)
+	}
+	if got := New(Config{BaseURL: "https://example.test"}).scrub(cause); got != cause { //nolint:errorlint // identity
+		t.Error("a client with no key has nothing to scrub")
+	}
+}

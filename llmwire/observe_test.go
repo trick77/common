@@ -1,0 +1,204 @@
+package llmwire
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+)
+
+func wantAll(t *testing.T, got string, wants ...string) {
+	t.Helper()
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("missing %q in:\n%s", w, got)
+		}
+	}
+}
+
+// The success line carries the figures and never the text.
+func TestChat_logsTheCallWithoutItsText(t *testing.T) {
+	srv := jsonServer(t, 200, goodCompletion)
+	c, buf := capture(t, Config{BaseURL: srv.URL, IdleTimeout: time.Second, CallTimeout: 20 * time.Second})
+	if _, _, err := c.Chat(context.Background(), ChatRequest{
+		Model: "glm-5.3-flash", Messages: []Message{User("the secret prompt")}, Reasoning: ReasoningEffort("low"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	if strings.Count(got, "\n") != 1 {
+		t.Fatalf("want one line, got:\n%s", got)
+	}
+	wantAll(t, got, `level=DEBUG msg="llmwire call"`, "kind=chat", "model=glm-5.3-flash",
+		"messages=1", "reasoning=low", "finish_reason=stop", "content_chars=5", "reasoning_chars=7",
+		"usage_reported=true", "input_tokens=258", "cache_read_tokens=192", "output_tokens=100",
+		"reasoning_tokens=40", "cost_usd=0.000066", "cost_provenance=from-table", "total_ms=")
+	for _, leak := range []string{"secret", "hello", "thought"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("%q reached the log: %s", leak, got)
+		}
+	}
+}
+
+// An answer cut by the output cap is a Warn with a name; a tool-call-only
+// turn, which is also content-less, is not.
+func TestChat_anomaliesAreNamedWarnings(t *testing.T) {
+	cases := []struct {
+		name, body, want string
+	}{
+		{"length", `{"choices":[{"finish_reason":"length","message":{"content":"partial"}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+			`level=WARN msg="llmwire answer truncated by the output cap"`},
+		{"empty", `{"choices":[{"finish_reason":"stop","message":{"content":""}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":0}}`,
+			`level=WARN msg="llmwire answer empty"`},
+		{"tool call only", `{"choices":[{"finish_reason":"tool_calls","message":{"content":"",
+			"tool_calls":[{"id":"1","type":"function","function":{"name":"f","arguments":"{}"}}]}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+			`level=DEBUG msg="llmwire call"`},
+		{"no usage", `{"choices":[{"finish_reason":"stop","message":{"content":"x"}}]}`,
+			`level=WARN msg="llmwire call unaccounted, no usage reported"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := jsonServer(t, 200, tc.body)
+			c, buf := capture(t, Config{BaseURL: srv.URL, IdleTimeout: time.Second, CallTimeout: 20 * time.Second})
+			if _, _, err := c.Chat(context.Background(), hiRequest()); err != nil {
+				t.Fatal(err)
+			}
+			wantAll(t, buf.String(), tc.want)
+		})
+	}
+}
+
+// A failure is a Warn naming the bound, with the timing it fired at.
+func TestChatStream_logsTheBoundThatFired(t *testing.T) {
+	srv := sseServer(t, []string{
+		`data: {"choices":[{"delta":{"content":"hel"}}]}`,
+		`data: {"choices":[{"delta":{"content":"lo"}}]}`,
+	}, reply{gap: 2 * time.Second})
+	c, buf := capture(t, Config{BaseURL: srv.URL, IdleTimeout: 50 * time.Millisecond, CallTimeout: 20 * time.Second})
+	s, _, err := c.ChatStream(context.Background(), hiRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.Collect(nil); !errors.Is(err, ErrStreamIdle) {
+		t.Fatalf("err = %v, want the idle bound", err)
+	}
+	wantAll(t, buf.String(), `level=WARN msg="llmwire call failed"`, "kind=chat_stream",
+		"error=\"llmwire: stream idle for 50ms\"", "total_ms=", "content_chars=3")
+}
+
+// A non-2xx is a Warn with the status; a 429 adds the retry hint.
+func TestChat_logsTheStatus(t *testing.T) {
+	srv := jsonServer(t, 429, `{"error":{"message":"slow down"}}`)
+	c, buf := capture(t, Config{BaseURL: srv.URL, IdleTimeout: time.Second, CallTimeout: 20 * time.Second})
+	if _, _, err := c.Chat(context.Background(), hiRequest()); err == nil {
+		t.Fatal("want an error")
+	}
+	wantAll(t, buf.String(), `level=WARN msg="llmwire call failed"`, "status=429", "retry_after_ms=")
+}
+
+// Stats sum every finished call, failures counted apart, and the copy handed
+// out is the caller's.
+func TestStats_sumPerModel(t *testing.T) {
+	srv := jsonServer(t, 200, goodCompletion)
+	c, _ := capture(t, Config{BaseURL: srv.URL, IdleTimeout: time.Second, CallTimeout: 20 * time.Second})
+	for range 2 {
+		if _, _, err := c.Chat(context.Background(), hiRequest()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bad := jsonServer(t, 500, `{"error":{"message":"down"}}`)
+	c.baseURL = bad.URL
+	if _, _, err := c.Chat(context.Background(), hiRequest()); err == nil {
+		t.Fatal("want an error")
+	}
+
+	st := c.Stats()
+	m := st.Models["glm-5.3-flash"]
+	if m.Calls != 3 || m.Errors != 1 || m.Closed != 0 {
+		t.Errorf("calls/errors/closed = %d/%d/%d, want 3/1/0", m.Calls, m.Errors, m.Closed)
+	}
+	if m.InputTokens != 516 || m.CacheReadTokens != 384 || m.OutputTokens != 200 || m.ReasoningTokens != 80 {
+		t.Errorf("tokens = %+v", m)
+	}
+	if m.CostNanoUSD != 2*65_660 || m.UnpricedCalls != 1 || m.UnreportedCalls != 1 {
+		t.Errorf("cost = %d unpriced = %d unreported = %d, want 131320/1/1", m.CostNanoUSD, m.UnpricedCalls, m.UnreportedCalls)
+	}
+	st.Models["glm-5.3-flash"] = ModelStats{}
+	if c.Stats().Models["glm-5.3-flash"].Calls != 3 {
+		t.Error("Stats handed out its own map")
+	}
+	var buf bytes.Buffer
+	slog.New(slog.NewTextHandler(&buf, nil)).Info("summary", "llmwire", c.Stats())
+	wantAll(t, buf.String(), "llmwire.glm-5.3-flash.calls=3", "llmwire.glm-5.3-flash.cost_usd=0.000131")
+}
+
+// A body that will not marshal is a failed call, not a call that never
+// happened: it gets its log line and its place in the stats, with the
+// validation warnings on the line.
+func TestChat_renderFailureIsLoggedAndCounted(t *testing.T) {
+	srv := jsonServer(t, 200, goodCompletion)
+	c, buf := capture(t, Config{BaseURL: srv.URL, IdleTimeout: time.Second, CallTimeout: 20 * time.Second})
+	req := hiRequest()
+	req.ToolChoice = ToolChoice{Mode: ToolChoiceAuto} // a validation warning
+	req.ExtraBody = map[string]any{"x": make(chan int)}
+	if _, _, err := c.Chat(context.Background(), req); err == nil {
+		t.Fatal("a channel in ExtraBody marshalled")
+	}
+	wantAll(t, buf.String(), "llmwire call failed", `model=glm-5.3-flash`, "warnings=")
+	if st := c.Stats().Models["glm-5.3-flash"]; st.Calls != 1 || st.Errors != 1 {
+		t.Errorf("stats = %+v, want one call, one error", st)
+	}
+}
+
+// Timing is measured on the dial failure too: the wait before the transport
+// gave up is the figure that says whether the bound or the host was slow.
+func TestChat_dialFailureCarriesTiming(t *testing.T) {
+	now, _ := stepClock()
+	c, buf := capture(t, Config{BaseURL: "http://127.0.0.1:1", Now: now})
+	if _, _, err := c.Chat(context.Background(), hiRequest()); err == nil {
+		t.Fatal("a dial to port 1 succeeded")
+	}
+	// stepClock advances one second per reading: start, then the reading
+	// after Do failed, so the failed dial reports a one-second wait.
+	wantAll(t, buf.String(), "llmwire call failed", "headers_ms=1000", "total_ms=1000")
+}
+
+func TestRawStream_dialFailureCarriesTiming(t *testing.T) {
+	now, _ := stepClock()
+	c := New(Config{BaseURL: "http://127.0.0.1:1", Now: now})
+	res, err := c.RawStream(context.Background(), []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("a dial to port 1 succeeded")
+	}
+	if res.Timing.Headers != time.Second || res.Timing.Total != time.Second {
+		t.Errorf("timing = %+v, want the measured wait on the dial failure", res.Timing)
+	}
+}
+
+// ChatStream shares RawStream's exchange, so its failed dial logs the same
+// figures rather than a Total that also counts the classification.
+func TestChatStream_dialFailureCarriesTiming(t *testing.T) {
+	now, _ := stepClock()
+	c, buf := capture(t, Config{BaseURL: "http://127.0.0.1:1", Now: now})
+	if _, _, err := c.ChatStream(context.Background(), hiRequest()); err == nil {
+		t.Fatal("a dial to port 1 succeeded")
+	}
+	wantAll(t, buf.String(), "llmwire call failed", "headers_ms=1000", "total_ms=1000")
+}
+
+func TestEmbed_dialFailureCarriesTiming(t *testing.T) {
+	now, _ := stepClock()
+	c, buf := capture(t, Config{BaseURL: "http://127.0.0.1:1", Now: now})
+	_, _, err := c.Embed(context.Background(), EmbedRequest{Model: "text-embedding-3-small", Inputs: []string{"a"}})
+	if err == nil {
+		t.Fatal("a dial to port 1 succeeded")
+	}
+	wantAll(t, buf.String(), "llmwire call failed", "headers_ms=1000", "total_ms=1000")
+}

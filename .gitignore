@@ -1,0 +1,5 @@
+# llmwire's evals read keys from llmwire/.env (copy llmwire/.env.example): never committed, ship's secret scan
+# enforces it.
+.env
+.claude/
+.agents/

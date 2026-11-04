@@ -1,0 +1,427 @@
+package llmwire
+
+import (
+	"encoding/json"
+	"time"
+)
+
+// The request vocabulary.
+//
+// These types are what every consumer binds to, so their shape was settled by
+// measurement rather than guessed: Phase 0 probed whether reasoning has to be
+// replayed through tool history before deciding whether Message carries it.
+// See FINDINGS.md.
+
+// Role is a message author.
+type Role string
+
+// The four roles the wire format defines.
+const (
+	RoleSystem    Role = "system"
+	RoleUser      Role = "user"
+	RoleAssistant Role = "assistant"
+	RoleTool      Role = "tool"
+)
+
+// Message is one turn.
+//
+// Content is either plain text or a sequence of parts. Both spellings exist on
+// the wire and the difference is not cosmetic: a text-only model rejects the
+// parts form outright once it contains an image, so the encoder emits whichever
+// the message actually needs rather than always using the richer one.
+type Message struct {
+	Role Role
+	// Text is the whole content, for the common single-string case.
+	Text string
+	// Parts, when non-empty, replaces Text. Used for multimodal turns.
+	Parts []Part
+
+	// ToolCalls are the calls an assistant turn requested.
+	ToolCalls []ToolCall
+	// ToolCallID ties a tool result back to the call that asked for it.
+	// Required on a RoleTool message.
+	ToolCallID string
+
+	// ReasoningContent is the model's thinking from a previous assistant turn.
+	//
+	// OPTIONAL, and measured to be so. A vendor issue reports a 400 with "The
+	// reasoning_content in the thinking mode must be passed back to the API"
+	// when an assistant turn carrying tool_calls is replayed without it. That
+	// does not reproduce on the deployments in the registry — a replay omitting
+	// it was accepted — and a production caller has been omitting it for
+	// months. The field exists so a deployment that does demand it can be fed,
+	// not because one currently does.
+	ReasoningContent string
+
+	// ResponseItems is an assistant turn exactly as a Responses-protocol model
+	// returned it: its encrypted reasoning, its function calls and its text, in
+	// output order. OPAQUE: set by ChatResponse.Assistant and
+	// StreamResult.Assistant, replayed verbatim, never built by hand.
+	//
+	// It is what carries the model's reasoning across a tool round. MEASURED on
+	// gpt-6.1-sol via LiteLLM/Azure, 2026-10-19: round two replaying the
+	// reasoning item beside the call and its output was accepted, input_tokens
+	// 97 → 177. Rebuilding the turn from Text and ToolCalls alone drops it, and
+	// the model reasons from scratch every round.
+	//
+	// Sent only to a wire_api: responses model, where it replaces Text and
+	// ToolCalls on the wire. Any other model drops it with a warning and sends
+	// Text and ToolCalls as usual.
+	ResponseItems []json.RawMessage
+}
+
+// PartKind distinguishes the content parts a message can carry.
+type PartKind string
+
+// The content part kinds a message can carry.
+const (
+	PartText  PartKind = "text"
+	PartImage PartKind = "image_url"
+)
+
+// Part is one element of a multimodal message.
+type Part struct {
+	Kind PartKind
+	// Text is set when Kind is PartText.
+	Text string
+	// URL is set when Kind is PartImage. A data: URI is accepted and is how an
+	// inline image is sent.
+	URL string
+}
+
+// TextMessage builds a plain-text turn.
+func TextMessage(role Role, text string) Message {
+	return Message{Role: role, Text: text}
+}
+
+// System builds a system message. It, User and Assistant are shorthands for
+// the three ordinary roles.
+func System(text string) Message { return TextMessage(RoleSystem, text) }
+
+// User builds a user message.
+func User(text string) Message { return TextMessage(RoleUser, text) }
+
+// Assistant builds an assistant message.
+func Assistant(text string) Message { return TextMessage(RoleAssistant, text) }
+
+// ToolResult builds the reply to a tool call.
+func ToolResult(callID, content string) Message {
+	return Message{Role: RoleTool, ToolCallID: callID, Text: content}
+}
+
+// HasImage reports whether the message carries an image part, which is what
+// validation checks against a model's vision capability.
+func (m Message) HasImage() bool {
+	for _, p := range m.Parts {
+		if p.Kind == PartImage {
+			return true
+		}
+	}
+	return false
+}
+
+// Tool is a function offered to the model.
+type Tool struct {
+	Name        string
+	Description string
+	// Parameters is a JSON Schema object. Held as a decoded value rather than a
+	// string so a caller can build it however it likes.
+	Parameters map[string]any
+	// Strict asks for strict schema adherence. Passed through as sent: no
+	// profile measures tool-level strictness, so it is not gated on the
+	// unrelated response_format bit. Some compat servers reject the field.
+	Strict bool
+}
+
+// ToolChoiceMode is how the model should decide about calling a tool.
+type ToolChoiceMode string
+
+const (
+	// ToolChoiceUnset leaves the field off the wire entirely.
+	ToolChoiceUnset ToolChoiceMode = ""
+	// ToolChoiceAuto lets the model decide whether to call a tool.
+	ToolChoiceAuto ToolChoiceMode = "auto"
+	// ToolChoiceNone forbids tool calls for this request.
+	ToolChoiceNone ToolChoiceMode = "none"
+	// ToolChoiceRequired compels some tool call.
+	ToolChoiceRequired ToolChoiceMode = "required"
+	// ToolChoiceFunction compels one named tool; set ToolChoice.Name too.
+	ToolChoiceFunction ToolChoiceMode = "function"
+)
+
+// ToolChoice constrains tool selection.
+type ToolChoice struct {
+	Mode ToolChoiceMode
+	// Name is the tool to compel, when Mode is ToolChoiceFunction.
+	Name string
+}
+
+// ResponseFormatKind is the structured-output mode.
+type ResponseFormatKind string
+
+const (
+	// FormatUnset leaves the field off the wire entirely.
+	FormatUnset ResponseFormatKind = ""
+	// FormatText asks for ordinary text.
+	FormatText ResponseFormatKind = "text"
+	// FormatJSONObject asks for a single JSON object, with no schema.
+	FormatJSONObject ResponseFormatKind = "json_object"
+	// FormatJSONSchema asks for output conforming to a named schema.
+	FormatJSONSchema ResponseFormatKind = "json_schema"
+)
+
+// ResponseFormat constrains the shape of the reply.
+//
+// Worth reaching for rather than trusting a prompt: on one model in the registry
+// a prompt saying "reply as JSON" produced a raw reply that parsed 0 times out
+// of 8, while the same prompt with a response format parsed 8 out of 8.
+type ResponseFormat struct {
+	Kind ResponseFormatKind
+	// Name identifies the schema. Required by FormatJSONSchema.
+	Name string
+	// Schema is a JSON Schema object, for FormatJSONSchema.
+	Schema map[string]any
+	// Strict asks for exact schema adherence.
+	Strict bool
+}
+
+// text reports whether the reply is free text, the only kind a response-side
+// cut may touch. A JSON reply is never cut: a string value may quote the tag or
+// markup being cut, and the cut would leave a fragment that no longer parses.
+func (f ResponseFormat) text() bool {
+	return f.Kind == FormatUnset || f.Kind == FormatText
+}
+
+// ReasoningRequest is how much thinking to ask for.
+//
+// A sum type rather than a string, so validation is "does this variant match one
+// the profile allows" rather than a string comparison against a set the caller
+// had to know. The three variants mirror the three controls models actually
+// expose; a request variant that does not match the profile's control is
+// refused by name rather than sent and rejected.
+type ReasoningRequest interface{ isReasoning() }
+
+type reasoningOff struct{}
+type reasoningEffort struct{ level string }
+type reasoningBudget struct{ tokens int }
+
+func (reasoningOff) isReasoning()    {}
+func (reasoningEffort) isReasoning() {}
+func (reasoningBudget) isReasoning() {}
+
+// ReasoningOff asks the model not to reason.
+//
+// Refused before any request is sent when the profile says the model cannot
+// comply — which is the case for at least one model in the registry, whose
+// vendor documentation claims otherwise.
+func ReasoningOff() ReasoningRequest { return reasoningOff{} }
+
+// ReasoningEffort asks for a named depth. The accepted levels are per-model and
+// narrower than the vendor's global enum.
+func ReasoningEffort(level string) ReasoningRequest { return reasoningEffort{level: level} }
+
+// ReasoningBudget asks for a token budget.
+func ReasoningBudget(tokens int) ReasoningRequest { return reasoningBudget{tokens: tokens} }
+
+// The two intents. A caller that names a level binds itself to one model's
+// vocabulary: "low" is the floor on glm-5.3-flash and a middle rung on gpt-5.x,
+// and "none" is refused outright by the first. An intent is resolved against the
+// profile per request, into one of the three concrete variants above, and from
+// there on is validated, rendered, logged and priced exactly as that variant.
+// What it became is on ChatResponse.ReasoningSent and StreamResult.ReasoningSent.
+type reasoningMinimal struct{}
+type reasoningBalanced struct{}
+
+func (reasoningMinimal) isReasoning()  {}
+func (reasoningBalanced) isReasoning() {}
+
+// ReasoningMinimal asks for the shallowest thinking the model has: off where the
+// profile says it can be disabled, else the first (shallowest) of its
+// effort_values, else, on a budget model, its reasoning.min_budget. On a model
+// that does not reason it sends nothing and warns nothing: the request is
+// already as shallow as it gets.
+func ReasoningMinimal() ReasoningRequest { return reasoningMinimal{} }
+
+// ReasoningBalanced asks for fast-but-not-shallow: the profile's
+// reasoning.balanced level where one is declared, else the model's own default
+// (nothing is sent).
+func ReasoningBalanced() ReasoningRequest { return reasoningBalanced{} }
+
+// ChatRequest is one completion request, before profile resolution.
+//
+// Pointers where "unset" and "zero" differ: a temperature of 0 is a real
+// request, and so is a MaxTokens the caller deliberately left alone.
+type ChatRequest struct {
+	// Model is a registry id, matched exactly.
+	Model    string
+	Messages []Message
+
+	Reasoning   ReasoningRequest
+	Temperature *float64
+	TopP        *float64
+	// MaxTokens caps the completion. Written once here; the profile decides
+	// which wire parameter carries it, because the two spellings are not
+	// interchangeable and one endpoint accepts the wrong one and ignores it.
+	MaxTokens *int
+	// MaxAnswerTokens caps the visible answer instead of the whole completion.
+	// The cap sent is this plus the reasoning overhead of the request as
+	// resolved (Reasoning.Overhead, DefaultReasoningOverhead where the profile
+	// has no figure for the level, 0 with thinking off), clamped to the model's
+	// max_output. Setting it beside MaxTokens is refused.
+	//
+	// Exists because the completion cap counts reasoning: a 1024-token cap at
+	// glm-5.3-flash's deepest level returned zero content characters.
+	MaxAnswerTokens *int
+
+	Tools      []Tool
+	ToolChoice ToolChoice
+
+	ResponseFormat ResponseFormat
+
+	// Stop sequences. Always sent when non-empty: no profile in the registry
+	// records an endpoint refusing them, so there is no capability to gate on.
+	Stop []string
+
+	// ExtraBody is merged into the request body verbatim, for the long tail of
+	// provider-specific parameters this package does not model. Keys collide
+	// with generated ones at the caller's risk: they win, deliberately, since
+	// the point is to reach something the package does not know about.
+	//
+	// Four keys are refused by plan rather than merged, because each would
+	// make the body lie about itself: "stream" and "stream_options" (the
+	// method called and the profile decide them), "model" (the route decides
+	// what goes on the wire) and the output-cap spelling this model does NOT
+	// take (the one an endpoint accepts and silently ignores).
+	ExtraBody map[string]any
+
+	// ToolCallIdleTimeout replaces the client's IdleTimeout for the rest of a
+	// streamed call once the first tool-call fragment has arrived, or once
+	// inline markup has been seen. Zero leaves the idle bound as it is.
+	//
+	// The only per-request bound, because it answers a per-request question.
+	// A model whose profile sets Streaming.BuffersToolArgs does not stream
+	// tool-call arguments incrementally: it emits the name, goes silent while
+	// it serializes the whole argument server-side, then flushes it in one
+	// burst, past any idle bound sized for prose (profiles.yaml has the
+	// measurement). Which calls can carry such an argument depends on which
+	// tools the request offered, so the caller widens only those and keeps the
+	// narrow bound for every other turn. The whole-call cap stays the backstop.
+	ToolCallIdleTimeout time.Duration
+
+	// BestEffort demotes what would be a hard error into a coercion plus a
+	// Warning, for one call. Deliberately per-request rather than a package
+	// global: a process-wide switch is a landmine, because the call that
+	// silently changes behaviour is never the one that set it.
+	BestEffort bool
+}
+
+// clone copies a request deeply enough that coercing the copy cannot touch the
+// caller's own slices and maps.
+//
+// Validation coerces: it drops an image part, relaxes a tool choice, fills in a
+// recommended temperature. Doing that in place would mean a call documented as
+// read-only quietly editing the caller's request — and with Validate exported,
+// checking a request at boot would mutate the very thing being checked.
+//
+// Tool.Parameters, ResponseFormat.Schema and the values inside ExtraBody are
+// NOT deep-copied: nothing in this package writes through them, and copying an
+// arbitrary caller-supplied JSON tree would be both expensive and lossy.
+func (r ChatRequest) clone() ChatRequest {
+	out := r
+	if r.Messages != nil {
+		out.Messages = make([]Message, len(r.Messages))
+		copy(out.Messages, r.Messages)
+		for i := range out.Messages {
+			out.Messages[i].Parts = append([]Part(nil), r.Messages[i].Parts...)
+			out.Messages[i].ToolCalls = append([]ToolCall(nil), r.Messages[i].ToolCalls...)
+			out.Messages[i].ResponseItems = append([]json.RawMessage(nil), r.Messages[i].ResponseItems...)
+		}
+	}
+	out.Tools = append([]Tool(nil), r.Tools...)
+	out.Stop = append([]string(nil), r.Stop...)
+	out.Temperature = copyPtr(r.Temperature)
+	out.TopP = copyPtr(r.TopP)
+	out.MaxTokens = copyPtr(r.MaxTokens)
+	out.MaxAnswerTokens = copyPtr(r.MaxAnswerTokens)
+	if r.ExtraBody != nil {
+		out.ExtraBody = make(map[string]any, len(r.ExtraBody))
+		for k, v := range r.ExtraBody {
+			out.ExtraBody[k] = v
+		}
+	}
+	return out
+}
+
+// EmbedRequest is one embeddings request.
+type EmbedRequest struct {
+	Model  string
+	Inputs []string
+	// Dimensions shortens the returned vectors. Only the -3 generation accepts
+	// it; older models reject it outright.
+	Dimensions *int
+
+	// BestEffort demotes a capability refusal into a coercion plus a Warning, as
+	// on a chat request. It cannot rescue a malformed request: an empty input list
+	// or an empty string has nothing to send instead.
+	BestEffort bool
+}
+
+// EmbedResponse is a batch of vectors, in the order of the inputs that produced
+// them.
+type EmbedResponse struct {
+	Vectors [][]float32
+	Usage   Usage
+	Model   string
+	// Timing is summed over the batches the inputs were split into, so it is
+	// the wall-clock the whole call spent on the wire, not one request's.
+	Timing Timing
+	// Gateway is the last batch's proxy headers, as on ChatResponse: its call
+	// id, and the key spend as of the end of the call. Empty on a direct route.
+	// Its Cost split is empty when the inputs took more than one batch.
+	Gateway Gateway
+}
+
+// ChatResponse is a completed non-streaming turn.
+type ChatResponse struct {
+	Content   string
+	Reasoning string
+	ToolCalls []ToolCall
+	// FinishReason is the endpoint's own string, treated as an open set.
+	FinishReason string
+	Usage        Usage
+	// Model is what actually ran, which behind a gateway is not what was asked
+	// for: the response body carries the alias, and the real deployment is only
+	// in a header.
+	Model string
+	// Raw is the undecoded response, kept for fields this package does not model.
+	Raw    json.RawMessage
+	Timing Timing
+	// Gateway is what the proxy said in its headers: call id, deployment, key
+	// spend, the cost text. Empty on a direct route.
+	Gateway Gateway
+	// ReasoningSent is the reasoning knob this call put on the wire, intents
+	// resolved: "off", an effort level, "budget:<tokens>", or "" when nothing
+	// was sent and the model ran at its own default. Named by wire meaning:
+	// effort "none" and a zero budget are the off switch and read "off".
+	ReasoningSent string
+	// ResponseItems is the turn for replay; see Message.ResponseItems. Empty
+	// unless the model speaks the Responses protocol.
+	ResponseItems []json.RawMessage
+}
+
+// Assistant is this turn as the history entry for the next request: text,
+// tool calls and, on a Responses-protocol model, the reasoning state. A tool
+// loop appends this, never a Message rebuilt from Content and ToolCalls,
+// which would lose the reasoning.
+func (r *ChatResponse) Assistant() Message {
+	return assistantTurn(r.Content, r.ToolCalls, r.ResponseItems)
+}
+
+func assistantTurn(content string, calls []ToolCall, items []json.RawMessage) Message {
+	return Message{
+		Role:          RoleAssistant,
+		Text:          content,
+		ToolCalls:     append([]ToolCall(nil), calls...),
+		ResponseItems: append([]json.RawMessage(nil), items...),
+	}
+}

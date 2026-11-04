@@ -1,0 +1,635 @@
+package llmwire
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+)
+
+// SSE parsing for OpenAI-compatible chat completions.
+//
+// The wire details below are load-bearing and each cost a debugging session
+// somewhere. They are recorded here rather than rediscovered.
+//
+// FRAMING
+//
+//   - "data:" has NO trailing space in the prefix match. SSE permits both
+//     "data:{...}" and "data: {...}", and matching only the spaced form makes
+//     every event from an endpoint that omits it fall through as a non-data
+//     line — silently, with no error anywhere.
+//   - A malformed data line is skipped, not fatal. One unparseable keepalive
+//     must not discard an answer that otherwise completed.
+//   - Completion is ASSERTED, never inferred. Only "[DONE]" or a finish_reason
+//     ends a stream cleanly. A connection dropped mid-answer ends the scan
+//     exactly as a finished one does — cleanly, with no read error — so
+//     accepting whatever arrived would hand back a truncated answer as success.
+//
+// REASONING
+//
+//   - Reasoning arrives on its own delta field, reasoning_content, with content
+//     null throughout. A long thinking phase therefore produces a steady flow
+//     of events carrying no output at all, which is why liveness is measured in
+//     events rather than in characters.
+//   - Some endpoints spell the same field "reasoning". Both are read; content
+//     wins if an endpoint somehow sends both.
+//
+// USAGE
+//
+//   - Its position differs by endpoint, and both shapes must work. MiMo-style:
+//     a trailing chunk AFTER the finish_reason chunk, with an EMPTY choices
+//     array — stopping at finish_reason loses all accounting, and indexing
+//     choices[0] on it panics. Z.ai-style: finish_reason, a non-empty delta and
+//     usage all in the SAME chunk.
+//   - The finish_reason chunk commonly carries "usage": null. A usage field
+//     being PRESENT is therefore not the same as usage being REPORTED, so the
+//     last usage that wireUsage.reported() accepts is kept, not the last seen.
+//
+// FAILURE INSIDE A SUCCESS
+//
+//   - An error can arrive as a frame inside a 200 stream: one frame, no
+//     choices, an "error" object. This is what an OpenAI-style upstream sends
+//     when it fails AFTER the status line is committed, and what a LiteLLM
+//     proxy sends when an SSE keepalive ping has already forced the 200.
+//     Dropping that frame reads as a clean, empty stream.
+
+const (
+	dataPrefix = "data:"
+	doneMarker = "[DONE]"
+	// maxStreamLine caps one SSE line. A delta is ordinarily a few words, but
+	// the bound is generous because the cost of guessing low is a failed
+	// completion on a legitimately large chunk — a tool call whose arguments
+	// are a whole file arrives as one line. bufio's 64 KiB default is a guess
+	// nobody made deliberately.
+	maxStreamLine = 1 << 20
+	maxErrorBody  = 4 << 10
+	// maxErrorRead bounds what httpError reads before decoding. Larger than
+	// the field cap: LiteLLM writes code after a message that embeds the
+	// upstream text, so a body cut at the field cap loses the code to the
+	// decode. Every kept field is capped at maxErrorBody afterwards.
+	maxErrorRead = 64 << 10
+)
+
+// streamDelta is one chunk's incremental payload.
+type streamDelta struct {
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content"`
+	// Reasoning is the alternate spelling some OpenAI-compatible servers use
+	// for the same channel.
+	Reasoning string          `json:"reasoning"`
+	ToolCalls []toolCallDelta `json:"tool_calls"`
+}
+
+// reasoningText returns whichever reasoning spelling this endpoint used.
+func (d streamDelta) reasoningText() string {
+	return reasoningSpelling(d.ReasoningContent, d.Reasoning)
+}
+
+// reasoningSpelling picks the reasoning text from the two field names
+// servers use for the same channel: reasoning_content wins if an endpoint
+// somehow sends both. Shared by the stream and the non-streaming decoder so
+// the two cannot disagree.
+func reasoningSpelling(reasoningContent, reasoning string) string {
+	if reasoningContent != "" {
+		return reasoningContent
+	}
+	return reasoning
+}
+
+// toolCallDelta is a fragment of a native tool call. Arguments stream as a
+// string built up across chunks, keyed by Index — Id and Name arrive once, on
+// the first fragment, and are empty on the rest.
+type toolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name string `json:"name"`
+		// Raw for the same reason as the non-streaming shape: a compat
+		// server may send an object fragment where the reference streams
+		// string pieces. argumentsText reads both.
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
+// argumentsDelta is the fragment's argument text, whichever shape it took.
+func (d toolCallDelta) argumentsDelta() string { return argumentsText(d.Function.Arguments) }
+
+// ToolCall is a completed tool call assembled from its fragments.
+type ToolCall struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// streamChunk is one `data:` event.
+type streamChunk struct {
+	Choices []struct {
+		Delta        streamDelta `json:"delta"`
+		FinishReason string      `json:"finish_reason"`
+	} `json:"choices"`
+	// Usage is kept raw so the identical bytes can feed both the decoder and a
+	// debug line showing what the endpoint really sent — which is what settles
+	// whether a zero is an answer or an unrecognised field name.
+	Usage json.RawMessage `json:"usage"`
+	// Error catches the failure-inside-a-200 case described in the head
+	// comment.
+	Error json.RawMessage `json:"error"`
+}
+
+// StreamResult is what a completed stream yielded.
+type StreamResult struct {
+	Content   string
+	Reasoning string
+	ToolCalls []ToolCall
+	// FinishReason is the endpoint's own string and is treated as an OPEN set.
+	// Vendors add their own beyond the OpenAI vocabulary — MiMo sends
+	// "repetition_truncation", Z.ai sends "sensitive",
+	// "model_context_window_exceeded" and "network_error" — so this is never
+	// switched on exhaustively.
+	FinishReason string
+	Usage        Usage
+	// Events counts `data:` frames received, Chars counts runes of content.
+	Events int64
+	Chars  int64
+	// Done records that the endpoint sent [DONE].
+	Done bool
+	// MaxCommentGap is the longest interval between two `data:` frames,
+	// measured from the moment the body opened, whatever the endpoint sent in
+	// between: comment lines, blank keepalives, or nothing. Recorded because
+	// the idle guard deliberately does NOT re-arm on non-data lines, so this
+	// is the margin between that policy and a false abort — the number the
+	// transport probe exists to measure. The silence after the last frame is
+	// not in it. It differs from MaxDataGap only in excluding the wait for the
+	// first frame.
+	MaxCommentGap time.Duration
+	// Timing is set on the error path too: a stream cut mid-answer still has
+	// a measured Total, and that figure beside the named bound in the error is
+	// what settles whether the bound or the endpoint was wrong.
+	Timing Timing
+	// MaxDataGap is the longest silence between two `data:` frames, the wait
+	// for the first one included. It is exactly what the idle guard raced
+	// against, so comparing it to IdleTimeout says how close a healthy stream
+	// came to a false abort.
+	MaxDataGap time.Duration
+	// Gateway is what the proxy said in its headers. A stream carries no cost
+	// there, but the call id and the deployment still arrive.
+	Gateway Gateway
+	// Bytes counts the SSE lines read, data lines and comments alike, without
+	// their line terminators.
+	Bytes int64
+	// ReasoningSent is the reasoning knob the request put on the wire, as on
+	// ChatResponse. Empty from RawStream, which sits below the plan.
+	ReasoningSent string
+	// ResponseItems is the turn for replay; see Message.ResponseItems.
+	ResponseItems []json.RawMessage
+}
+
+// Assistant is this turn as the history entry for the next request, as on
+// ChatResponse.
+func (r StreamResult) Assistant() Message {
+	return assistantTurn(r.Content, r.ToolCalls, r.ResponseItems)
+}
+
+// streamBounds are the idle bounds a stream runs under: idle for the whole
+// stream, toolIdle replacing it once a tool call is underway (zero: no change).
+type streamBounds struct {
+	idle, toolIdle time.Duration
+}
+
+// streamEvent is one increment the reader hands onward. Every channel the parser
+// understands is represented, not only content: an iterator that could not see
+// reasoning deltas or tool-call fragments would be strictly weaker than the
+// accumulated result it sits in front of, and callers would go back to waiting for
+// the whole answer.
+type streamEvent struct {
+	kind         eventKind
+	text         string
+	toolCall     toolCallDelta
+	finishReason string
+}
+
+type eventKind uint8
+
+const (
+	evContent eventKind = iota
+	evReasoning
+	evToolCall
+	evFinish
+)
+
+// readStream consumes an SSE body.
+//
+// The idle guard is re-armed on `data:` frames ONLY — never on blank separators
+// or on SSE comment lines (": ping"). Those prove the connection is alive but
+// say nothing about the model making progress, and an upstream that emits them
+// on a timer would otherwise mask a model that has stalled completely. Reasoning
+// deltas are real data frames, so a legitimately long thinking phase still
+// re-arms the guard and is unaffected by this rule.
+//
+// With recovery set, content and reasoning deltas pass through an inline gate
+// before reaching the sink (see inline.go): text before a marker streams as
+// usual, the markup and everything after it is withheld, the first call's name
+// is surfaced as a tool-call event as soon as it parses, and the calls recovered
+// at the end are emitted as one fragment each. The returned warnings say what
+// recovery found.
+//
+// bounds.toolIdle, when set, replaces the idle bound from the first tool-call
+// fragment or inline marker on, and the guard is re-armed with it at once: the
+// silence it exists to tolerate starts right there.
+//
+// start is when the request was sent and now is the client's clock; both come
+// from the caller so every Timing figure shares one clock and one origin. Total
+// is written on every return, the error ones included, which is what the named
+// result and the deferred write are for.
+func readStream(body io.Reader, guard *stallGuard, bounds streamBounds, sink func(streamEvent), redact redactor, recovery bool, now func() time.Time, start time.Time) (res StreamResult, _ []Warning, err error) {
+	defer func() { res.Timing.Total = now().Sub(start) }()
+	var (
+		content   strings.Builder
+		reasoning strings.Builder
+		tools     = map[int]*ToolCall{}
+		order     []int
+	)
+	idle := bounds.idle
+	// toolUnderway widens the idle bound once, the moment a tool call is known
+	// to be in progress.
+	toolUnderway := func() {
+		if bounds.toolIdle > 0 && idle != bounds.toolIdle {
+			idle = bounds.toolIdle
+			guard.arm(idle, stallIdle)
+		}
+	}
+	emit := func(ev streamEvent) {
+		if sink != nil {
+			sink(ev)
+		}
+	}
+
+	// Gates exist only when the profile asks for recovery; a nil gate passes
+	// text straight through.
+	var contentGate, reasoningGate *inlineGate
+	if recovery {
+		contentGate, reasoningGate = &inlineGate{}, &inlineGate{}
+	}
+	// earlyName records which channel the first inline call's name went out
+	// from, under inlineToolCallID(0). When the call is then recovered from that
+	// same channel its final fragment carries the arguments only; a consumer
+	// that assigns the name on first sight is not told twice. Recovered from
+	// the other channel, the final fragment names the call again, because the
+	// early name may have been a different block's.
+	earlyName := ""
+	gated := func(g *inlineGate, kind eventKind, text string, buf *strings.Builder) {
+		buf.WriteString(text)
+		if g == nil {
+			emit(streamEvent{kind: kind, text: text})
+			return
+		}
+		if out := g.push(text); out != "" {
+			emit(streamEvent{kind: kind, text: out})
+		}
+		if !g.suppressed {
+			return
+		}
+		// Markup seen: the argument is being serialized, and on the model
+		// that emits it that means the silence the wider bound is for.
+		toolUnderway()
+		if earlyName != "" {
+			return
+		}
+		if name := firstInlineToolName(buf.String()); name != "" {
+			earlyName = map[eventKind]string{evContent: "content", evReasoning: "reasoning"}[kind]
+			var tc toolCallDelta
+			tc.ID, tc.Type, tc.Function.Name = inlineToolCallID(0), "function", name
+			emit(streamEvent{kind: evToolCall, toolCall: tc})
+		}
+	}
+	// With recovery on, the finish event is held back until the recovered calls
+	// have gone out: a consumer that stops at EventFinish would otherwise never
+	// see them, since finish_reason arrives before the tail is parsed.
+	var heldFinish *streamEvent
+	// frameErr is an error the endpoint sent as a frame inside the 200. It
+	// ends the scan but not the assembly: what arrived before it is still
+	// returned beside it, since Collect promises the paid-for partial.
+	var frameErr error
+
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 0, 64<<10), maxStreamLine)
+
+	meter := newFrameMeter(now, start)
+	for sc.Scan() {
+		res.Bytes += int64(len(sc.Bytes()))
+		line := strings.TrimRight(sc.Text(), "\r")
+		if !strings.HasPrefix(line, dataPrefix) {
+			// Deliberately no guard.arm here. See the doc comment.
+			continue
+		}
+		// Measured before re-arming, so the recorded gap is the real silence
+		// the guard had to tolerate.
+		meter.frame(&res)
+		guard.arm(idle, stallIdle)
+
+		payload := strings.TrimSpace(strings.TrimPrefix(line, dataPrefix))
+		if payload == doneMarker {
+			res.Done = true
+			break
+		}
+
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+
+		// A failure that arrived after the 200. Surfaced, not skipped: this
+		// frame carries no choices, so ignoring it yields a clean empty stream
+		// and the caller reports success with no answer.
+		if len(chunk.Error) > 0 && !isJSONNull(chunk.Error) {
+			frameErr = parseAPIErrorWith(redact, 0, chunk.Error)
+			break
+		}
+
+		for _, ch := range chunk.Choices {
+			if ch.Delta.Content != "" {
+				gated(contentGate, evContent, ch.Delta.Content, &content)
+				// Runes, not bytes: these endpoints return non-ASCII routinely,
+				// and a count inflated by UTF-8 encoding misreads as more
+				// output than the model produced.
+				res.Chars += int64(utf8.RuneCountInString(ch.Delta.Content))
+			}
+			if r := ch.Delta.reasoningText(); r != "" {
+				gated(reasoningGate, evReasoning, r, &reasoning)
+			}
+			for _, tc := range ch.Delta.ToolCalls {
+				toolUnderway()
+				emit(streamEvent{kind: evToolCall, toolCall: tc})
+				acc, seen := tools[tc.Index]
+				if !seen {
+					acc = &ToolCall{}
+					tools[tc.Index] = acc
+					order = append(order, tc.Index)
+				}
+				// Id, Type and Name arrive on the first fragment only; the
+				// rest carry argument text. Assigning unconditionally would
+				// blank them on every later fragment.
+				if tc.ID != "" {
+					acc.ID = tc.ID
+				}
+				if tc.Type != "" {
+					acc.Type = tc.Type
+				}
+				if tc.Function.Name != "" {
+					acc.Name = tc.Function.Name
+				}
+				acc.Arguments += tc.argumentsDelta()
+			}
+			if ch.FinishReason != "" {
+				res.FinishReason = ch.FinishReason
+				if recovery {
+					heldFinish = &streamEvent{kind: evFinish, finishReason: ch.FinishReason}
+				} else {
+					emit(streamEvent{kind: evFinish, finishReason: ch.FinishReason})
+				}
+			}
+		}
+
+		// Keep the last usage actually REPORTED, not the last one seen — the
+		// finish_reason chunk commonly rides along with "usage": null.
+		if len(chunk.Usage) > 0 {
+			var w wireUsage
+			if err := json.Unmarshal(chunk.Usage, &w); err == nil && w.reported() {
+				res.Usage = parseUsage(chunk.Usage)
+			}
+		}
+	}
+
+	res.Content = content.String()
+	res.Reasoning = reasoning.String()
+	for _, i := range order {
+		res.ToolCalls = append(res.ToolCalls, *tools[i])
+	}
+
+	// How the stream ended, decided before the recovery tail rather than
+	// returned from inside it: with recovery on, the gates may still hold text
+	// the consumer has not seen and the markup may still be in Content, and
+	// a partial result that skipped that step would hand back raw markup as
+	// the answer. So the tail runs on every ending, and the error rides out
+	// beside whatever it assembled.
+	var endErr error
+	switch {
+	case frameErr != nil:
+		endErr = frameErr
+	case sc.Err() != nil:
+		endErr = scanEndErr(sc.Err())
+	case !res.Done && res.FinishReason == "":
+		endErr = fmt.Errorf("llmwire: %w: stream ended after %d events (%d chars) without finish_reason or %s",
+			ErrMalformedResponse, res.Events, res.Chars, doneMarker)
+	}
+	if !recovery {
+		return res, nil, endErr
+	}
+	defer func() {
+		if heldFinish != nil {
+			emit(*heldFinish)
+		}
+	}()
+
+	// A held suffix that never grew into a marker is text the consumer has not
+	// seen yet; it goes out before the calls, in stream order.
+	if out := contentGate.flush(); out != "" {
+		emit(streamEvent{kind: evContent, text: out})
+	}
+	if out := reasoningGate.flush(); out != "" {
+		emit(streamEvent{kind: evReasoning, text: out})
+	}
+	rec := recoverInline(res.Content, res.Reasoning, len(res.ToolCalls))
+	res.Content, res.Reasoning = rec.content, rec.reasoning
+	for i, call := range rec.calls {
+		var tc toolCallDelta
+		tc.Index, tc.ID, tc.Type = i, call.ID, call.Type
+		// A recovered call is already text; encoded as the JSON string the
+		// wire would have carried so the delta reads like a native one.
+		tc.Function.Arguments, _ = json.Marshal(call.Arguments)
+		// The first call's name already went out under this id from the channel
+		// it was recovered from; a consumer that assigns names on first sight
+		// has it. From the other channel it is named again (see earlyName).
+		if i != 0 || earlyName != rec.channel {
+			tc.Function.Name = call.Name
+		}
+		emit(streamEvent{kind: evToolCall, toolCall: tc})
+		res.ToolCalls = append(res.ToolCalls, call)
+	}
+	return res, rec.warnings(), endErr
+}
+
+// scanEndErr classifies a body read that failed, for both stream readers.
+func scanEndErr(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// The read was stopped from this side: the caller, a guard or the
+		// call cap. explain names which; the endpoint did nothing wrong.
+		return fmt.Errorf("llmwire: reading stream: %w", err)
+	}
+	// A scanner failure is a stream cut short: a line past the cap, a body
+	// that ended mid-line. Wrapped in the sentinel a caller dispatches on for
+	// "the endpoint did not finish", the same one the missing-finish case
+	// carries.
+	return fmt.Errorf("llmwire: %w: reading stream: %w", ErrMalformedResponse, err)
+}
+
+// frameMeter records the silences between `data:` frames, shared by both
+// stream readers so the two protocols report Timing and gaps alike.
+//
+// Two clocks for the same silences: lastData starts with the body, so
+// MaxCommentGap measures the stream itself; lastFrame starts with the request,
+// so MaxDataGap includes the wait for the first frame, which is a gap the
+// guard had to tolerate too.
+type frameMeter struct {
+	now                        func() time.Time
+	start, lastData, lastFrame time.Time
+}
+
+func newFrameMeter(now func() time.Time, start time.Time) *frameMeter {
+	return &frameMeter{now: now, start: start, lastData: now(), lastFrame: start}
+}
+
+// frame records one `data:` frame on res.
+func (m *frameMeter) frame(res *StreamResult) {
+	at := m.now()
+	if gap := at.Sub(m.lastData); gap > res.MaxCommentGap {
+		res.MaxCommentGap = gap
+	}
+	if gap := at.Sub(m.lastFrame); gap > res.MaxDataGap {
+		res.MaxDataGap = gap
+	}
+	m.lastData, m.lastFrame = at, at
+	if res.Timing.FirstData == 0 {
+		res.Timing.FirstData = at.Sub(m.start)
+	}
+	// Counted per event rather than per line: an event is "data:…" plus a
+	// blank separator, so counting lines reports double, and a log saying 824
+	// for a 412-chunk stream is one nobody can reconcile.
+	res.Events++
+}
+
+// isJSONNull reports whether raw is the literal null, so a `"error": null` field
+// is not mistaken for a reported error.
+func isJSONNull(raw json.RawMessage) bool {
+	return strings.TrimSpace(string(raw)) == "null"
+}
+
+// Reasons a request was cancelled from our side, used verbatim in the returned
+// error so a failure names which bound gave up. The whole point is that "the
+// endpoint sent nothing at all" and "the model thought for a long time" stop
+// being the same log line.
+const (
+	stallHeaders = "no response headers"
+	stallIdle    = "stream idle"
+)
+
+// stallGuard cancels a request when nothing has arrived within the current
+// bound, and remembers why. It starts armed for headers and is re-armed for
+// idleness on every data frame, so one mechanism covers both phases while each
+// keeps its own name.
+//
+// Doing this rather than leaning on Transport.ResponseHeaderTimeout alone is
+// deliberate: that setting is one number for every route, and the header
+// phase needs a different bound on a stream than on a non-streaming call
+// (see rawCall). It is still set, as a backstop above both; this is the bound
+// actually relied on, and the one that names itself when it fires.
+type stallGuard struct {
+	cancel context.CancelFunc
+
+	mu       sync.Mutex
+	timer    *time.Timer
+	deadline time.Time     // when the current arming expires
+	pending  string        // reason the currently-armed deadline would report
+	bound    time.Duration // length of the current arming, reported beside pending
+	reason   string        // reason it actually fired with, "" while healthy
+	firedFor time.Duration // the bound that elapsed when it fired
+	fired    bool
+}
+
+// newStallGuard arms the guard for its first deadline. Callers must stop() it.
+func newStallGuard(cancel context.CancelFunc, d time.Duration, reason string) *stallGuard {
+	g := &stallGuard{cancel: cancel, pending: reason, bound: d, deadline: time.Now().Add(d)}
+	g.timer = time.AfterFunc(d, g.fire)
+	return g
+}
+
+// arm resets the deadline and the reason it would report. It is a no-op once
+// the guard has fired: the request is already being cancelled, and re-arming
+// would leave a cancelled call looking healthy.
+//
+// The deadline is recorded as a timestamp, not merely handed to Reset, because
+// Reset alone is not enough — see fire.
+//
+// Only stallIdle reaches reason today, but stallHeaders is the other half of
+// the pair and the message ends up in the user-visible timeout error, so the
+// parameter stays.
+//
+//nolint:unparam // reason is the stall message, not a constant
+func (g *stallGuard) arm(d time.Duration, reason string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.fired {
+		return
+	}
+	g.pending = reason
+	g.bound = d
+	g.deadline = time.Now().Add(d)
+	g.timer.Reset(d)
+}
+
+// fire cancels the request, unless the deadline moved while this firing was
+// already on its way.
+//
+// Reset cannot recall a callback the runtime has ALREADY scheduled. An event
+// arriving in the window between expiry and this function taking the mutex
+// therefore leaves arm() believing it disarmed the guard — it saw fired == false
+// — while this firing proceeds anyway. Two things went wrong without the check
+// below: a stream that had just revived was cancelled regardless, and the
+// failure was labelled with the reason arm() had just written rather than the
+// bound that actually elapsed. The second is the worse one, since naming the
+// right bound is this type's entire purpose. Comparing against the recorded
+// deadline makes a stale firing detectable and re-arms for the remaining time.
+func (g *stallGuard) fire() {
+	g.mu.Lock()
+	if g.fired {
+		g.mu.Unlock()
+		return
+	}
+	if remaining := time.Until(g.deadline); remaining > 0 {
+		g.timer.Reset(remaining)
+		g.mu.Unlock()
+		return
+	}
+	g.fired = true
+	g.reason, g.firedFor = g.pending, g.bound
+	g.mu.Unlock()
+	g.cancel()
+}
+
+// stop disarms the guard. It does not cancel the request; the caller's own
+// defer does that.
+func (g *stallGuard) stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.timer.Stop()
+}
+
+// firedReason returns why the guard cancelled and the bound that elapsed, or ""
+// if it did not fire. Read after a request error to turn a bare "context
+// canceled" into the bound that caused it. The duration comes from the guard,
+// not from the client's configured bounds: RawPost arms the header phase with the
+// whole-call cap, so the client's header bound would name a number that never
+// applied.
+func (g *stallGuard) firedReason() (string, time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.reason, g.firedFor
+}

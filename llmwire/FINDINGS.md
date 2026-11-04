@@ -1,0 +1,585 @@
+# Phase 0 findings
+
+Measured against live endpoints on 2026-09-12 with `LLMWIRE_EVAL=1 go test -run Probe`.
+Reproduce with the probes in `eval_probe_test.go`; each finding below names the
+probe that produced it.
+
+These measurements are the source of truth for the profile schema. Where a vendor
+doc or a published catalogue disagrees with a line here, the line here wins — and
+three of them do disagree.
+
+Endpoints: a MiMo Token Plan host serving `mimo-v2.5-pro`, `mimo-v2.5`,
+`mimo-v2.6-pro` and `mimo-v2.6-flash`, and Z.ai's general (non-Coding-Plan) host
+serving `glm-5.3-flash`.
+
+The V2.6 pair was added on 2026-09-22 (`mimo-v2.6-pro`, `mimo-v2.6-flash`
+sections below); the Z.ai probes skipped on that run for want of a key, so every
+`glm-5.3-flash` line dates from 2026-09-12 except the reasoning overhead, measured
+2026-11-01.
+
+## The three architecture questions
+
+### 1. MiMo returns native `tool_calls`, not inline XML
+
+`TestProbe_MiMoToolCallFormat`
+
+Both `mimo-v2.5-pro` and `mimo-v2.5` populated standard OpenAI `tool_calls` when
+offered a tool. No `<tool_call>`, `<function=` or `<tool_invocation` markup
+appeared in either `content` or `reasoning_content`.
+
+The model's own chat template does emit that XML, but the serving layer parses it
+before it reaches a client, which is what the vendor's SGLang `--tool-call-parser
+mimo` setting exists to do.
+
+`TestProbe_MiMoToolFreeCall` covered the narrower case loom's comment describes:
+a *forced tool-free* call, made with no tools offered at all, where a model that
+still decides to call something has nowhere to put the markup but the content
+stream. Both models returned clean prose, no markup, `finish_reason: stop`.
+
+**Consequence.** The ~270-line inline-XML parser and the dual-channel stream
+gating that loom and trift carry did not fire in either scenario tested.
+
+**But do not delete them on this evidence.** The tool-free probe used a synthetic
+prompt describing a prior search, not a genuine multi-round tool history, and
+loom's observation is of production traffic after real tool rounds. Two
+explanations fit equally well: the serving layer gained the `mimo` parser after
+loom's code was written, or the leak needs a longer, tool-saturated history than
+a probe reproduces. Inline recovery therefore ships as a **profile capability**
+(`tools.recover_inline_markup`), implemented in `inline.go` from loom's parser
+and its production captures, and switched ON for both MiMo profiles: it acts
+only when the markup appears, so a clean answer costs nothing, and a leak that
+does resurface is recovered instead of reaching a user.
+
+### 2. `reasoning_content` need not be replayed in history
+
+`TestProbe_MiMoReasoningReplayRequirement`
+
+A second tool round whose assistant turn carried `content` and `tool_calls` but
+**no** `reasoning_content` was accepted by `mimo-v2.5-pro`, with thinking on.
+
+A vendor issue reports HTTP 400 and *"The reasoning_content in the thinking mode
+must be passed back to the API"* for exactly this shape. It does not reproduce
+here, which matches loom building its history this way in production.
+
+**Consequence.** `Message.ReasoningContent` stays optional. No replay invariant,
+no forced plumbing through every consumer's history builder.
+
+### 3. The `data:`-only idle rule has a 60x margin
+
+`TestProbe_LongestCommentOnlyGap`
+
+Longest interval with no `data:` frame, on a deliberately deep call:
+
+| model | longest gap | frames | idle bound |
+|---|---|---|---|
+| `mimo-v2.5-pro` | 1.129s | 274 | 90s |
+| `glm-5.3-flash` | 1.396s | 1022 | 90s |
+
+**Consequence.** Re-arming the idle guard on `data:` frames only — never on blank
+lines or `: ping` comments — is safe on both endpoints. No per-profile
+`idle_rearm_on_keepalive` escape hatch is needed. Revisit if an endpoint is added
+whose measured gap exceeds half the bound.
+
+Incidentally measured: `glm-5.3-flash` at `reasoning_effort: max` with a 1024
+token cap produced **1022 frames and zero content characters** — the entire budget
+went to reasoning. That is the "cap counts reasoning, so a deep call returns
+empty" failure, reproduced.
+
+## Per-model profile data
+
+### `glm-5.3-flash`
+
+| bit | value | probe |
+|---|---|---|
+| `can_be_disabled` | **false** | `ZaiThinkingCanBeDisabled` |
+| `effort_values` | **`[low, high, max]`** | `ZaiReasoningEffortValues` |
+| `max_tokens_param` | **`max_tokens`** | `OutputCapParameter` |
+| `needs_include_usage` | **false** | `UsageReportingWithoutStreamOptions` |
+| `json_object` | **true** | `ResponseFormatSupport` |
+| `json_schema` | **true** | `ResponseFormatSupport` |
+| `reasoning.overhead` | **low 1024, high 5632** (max absent) | `ZaiReasoningOverhead` |
+
+`thinking: {"type":"disabled"}` is refused:
+
+```
+status 400, code 1210
+"This model always engages in thinking and cannot be disabled; please use low, high, or max"
+```
+
+`reasoning_effort` values `none`, `minimal`, `medium` and `xhigh` are refused with
+**the same code 1210 and the same message**. The code is therefore overloaded
+across two unrelated conditions, and the message names only a subset of what it
+rejects. Reasoning tokens scale with the accepted tiers: `low` 0, `high` 11,
+`max` 31 on a one-word prompt.
+
+**`max_completion_tokens` is accepted and silently ignored.** A request capping at
+16 returned 481 completion tokens with `finish_reason: stop`. Nothing is rejected
+and nothing signals the cap was dropped, so sending the wrong parameter name here
+means unbounded output rather than an error. This is the most expensive silent
+failure found.
+
+**At `high`, reasoning grows with the prompt and outlasts the default
+allowance.** Measured 2026-11-01 by `ZaiReasoningOverhead`, after a consumer's
+memory refresh (`MaxAnswerTokens` 1900, `ReasoningBalanced` = high, wire cap
+2924) saw reasoning 459, 474 and 1600 and two calls cut at the cap (>=2834,
+>=2923, prompts up to 17.5k tokens), answer starved. The probe sends that shape:
+a memory-maintenance system prompt, a sectioned memory, a multi-turn
+transcript, a different one per sample and the same one for both levels of a
+sample, cap 16384 on `max_tokens`. Five samples per level and size, two runs,
+no call cut in either (every `finish_reason: stop`). Run 2 recalibrated the
+prompt builder (4.47 chars a token, measured off run 1) to reach past
+production's 17.5k. In both runs a sample's three sizes shared one transcript,
+the smaller a prefix of the larger; the probe now seeds each size apart:
+
+| run | prompt tokens | `low` reasoning | `high` reasoning |
+|---|---|---|---|
+| 1 | ~2.8k | 183-324, p50 199 `[183 199 242 193 324]` | 542-1047, p50 871 `[542 871 1013 730 1047]` |
+| 1 | ~7.2k | 174-466, p50 275 `[174 308 224 466 275]` | 1110-2270, p50 1543 `[1110 1890 2270 1543 1432]` |
+| 1 | ~16.1k | 218-826, p50 260 `[218 260 246 448 826]` | 1476-3110, p50 2437 `[1476 2437 3110 2513 1820]` |
+| 2 | ~3.1k | 164-381, p50 188 `[164 381 188 182 256]` | 517-1450, p50 836 `[517 1450 1131 836 804]` |
+| 2 | ~8.0k | 134-315, p50 233 `[266 134 218 315 233]` | 861-1689, p50 1529 `[966 861 1663 1529 1689]` |
+| 2 | ~20.0k | 254-400, p50 295 `[258 400 295 380 254]` | 1032-5166, p50 1322 `[1322 1265 2599 5166 1032]` |
+
+`low` hardly moves with input. `high` mostly sits at 0.5k-2.6k and grows with
+the prompt, then takes a deep pass: one draw in five on a 20k prompt reasoned
+5166, twice anything else seen. Run 1 alone would have set `high` at 3584 and
+missed it. The profile sets `overhead: {low: 1024, high: 5632}`: the max of
+each level's 30 clean draws over both runs, rounded up to 512. `max` was not
+sampled and stays absent, so it and the no-knob case (which resolves to the
+`max` default) keep `DefaultReasoningOverhead`, known short there (the notes:
+a 1024 cap produced zero content). The one-word reading (`low` 0, `high` 11)
+said nothing about any of this.
+
+**Known limit: a fixed per-level allowance cannot follow input size.** `high`
+needs ~1.5k on a 3k prompt and was seen at 5k on a 20k one, so 5632 over-reserves
+short calls and still guarantees nothing past 20k, which was not measured.
+
+### `mimo-v2.5-pro`
+
+| bit | value | probe |
+|---|---|---|
+| `vision` | **false** | `MiMoImageInput` |
+| `max_tokens_param` | **both accepted and honoured** | `OutputCapParameter` |
+| `reasoning_effort` | **accepted** on chat/completions | `MiMoAcceptsReasoningEffort` |
+| `needs_include_usage` | **false** | `UsageReportingWithoutStreamOptions` |
+| `json_object` | **true** | `ResponseFormatSupport` |
+| `json_schema` | **true** | `ResponseFormatSupport` |
+
+An `image_url` part returns HTTP 404, *"No endpoints found that support image
+input"*.
+
+Both `max_tokens` and `max_completion_tokens` cap the completion: each returned
+exactly 16 tokens with `finish_reason: length`. The belief that only
+`max_completion_tokens` works is too strong — the alias is honoured too.
+
+`reasoning_effort` is accepted on chat/completions despite the vendor documenting
+it as a Responses-API parameter. Whether it changes anything is not established;
+it reported 0 reasoning tokens on a one-word prompt, as did the request without
+it.
+
+Latency is the thing to plan around, not tokens: single calls took **25–64
+seconds**, against 1–5 seconds for `glm-5.3-flash` on comparable prompts.
+
+### `mimo-v2.5`
+
+| bit | value | probe |
+|---|---|---|
+| `vision` | **true** | `MiMoImageInput` |
+| tool-call format | **native** | `MiMoToolCallFormat` |
+
+The same image part that 404s on `-pro` is accepted here. This is the split loom
+routes around, and the reason the module errors rather than rerouting: the two
+are different models with different capabilities, and a silent swap would
+misattribute cost.
+
+### `mimo-v2.6-pro`
+
+Measured on 2026-09-22. Vendor deprecates the V2.5 pair on 2026-10-21; the
+host's own `/models` listed `mimo-v2.6-pro` and `mimo-v2.6-flash` beside them.
+
+| bit | value | probe |
+|---|---|---|
+| `vision` | **true** | `MiMoImageInput` |
+| `max_tokens_param` | **both accepted and honoured** | `OutputCapParameter` |
+| `reasoning.can_be_disabled` | **true** | `MiMoThinkingCanBeDisabled` |
+| `reasoning.enabled_by_default` | **true** | `MiMoThinkingCanBeDisabled` |
+| `reasoning.effort_values` | **low, medium, high** (`xhigh` a 400) | `MiMoReasoningEffortValues` |
+| `needs_include_usage` | **false** | `UsageReportingWithoutStreamOptions` |
+| `json_object` / `json_schema` / `strict_schema` | **true** | `ResponseFormatSupport` |
+| tool-call format | **native** | `MiMoToolCallFormat` |
+| usage containment | **cached inside prompt** | `CachedTokensAreInsidePromptTokens` |
+
+**It accepts image input, and that reverses the V2.5 split.** The same
+`image_url` part that returns HTTP 404 *"No endpoints found that support image
+input"* on `mimo-v2.5-pro` is accepted here — with `mimo-v2.5-pro` re-probed as a
+control in the same run, still 404. The vendor's own model card is
+self-contradictory: the prose sells *"Omni-Modal Understanding"* and *"joint
+input and understanding of images, video, audio, and text"*, while the
+specification table on the same page lists **Input Modality: Text**, and
+OpenRouter documents text only. The prose is right.
+
+**First direct measurement of MiMo's thinking toggle.** Both V2.5 entries carry
+`can_be_disabled` on vendor documentation alone; no probe had ever sent the
+toggle to this vendor in either direction. Sent as a top-level `thinking:
+{"type": "disabled"}` (the card documents it inside the OpenAI SDK's
+`extra_body`, which is the same thing on the wire) it is accepted and honoured:
+
+| request | reasoning tokens | completion tokens | answer |
+|---|---|---|---|
+| `thinking: disabled` | 0 | 4 | `205` |
+| no knob at all | 54 | 59 | `205` |
+
+That second row is also what `enabled_by_default: true` rests on. Worth
+contrasting with Z.ai, where the vendor documents the same toggle and the
+endpoint refuses it outright with code 1210.
+
+**The reasoning lane is populated, where V2.5 reported zero.** On one arithmetic
+prompt, 197 of 202 completion tokens came back as `reasoning_tokens`;
+`mimo-v2.5` reported `0` on the identical prompt and counted its thinking inside
+`completion_tokens`. Code that read the lane as "this model does not think" will
+now see the real figure.
+
+**`reasoning_effort` is accepted with an enforced set, and the levels are flat.**
+`low` / `medium` / `high` return 200, `xhigh` is a 400 *"Invalid request
+parameters"* — the same set as V2.5, and still in no vendor document for this
+model. What the levels do is NOT established. One sample each:
+
+| level | reasoning tokens |
+|---|---|
+| none sent | 197 |
+| `low` | 67 |
+| `medium` | 69 |
+| `high` | 74 |
+
+The three levels do not separate from each other; they separate only from
+sending nothing, and in the direction a caller would not expect — every level
+thought *less* than no level at all. Not reproduced on `-flash` (43 / 27 / 55 /
+43), so this is one model, one prompt, one sample. Recorded as accepted-and-flat.
+
+**Cache starts cold and is contained.** `cached_tokens` went 0 then 10880 against
+a `prompt_tokens` of 10909 on the identical prompt, so pricing subtracts. Unlike
+`mimo-v2.5-pro` — which reported 192 of 258 cached on a tiny prompt because it
+injects its own system message — this endpoint reported 0 on a fresh 10.9k prompt.
+
+**Latency is 1-5 seconds**, and the longest gap with no `data:` frame was 1.03s
+over 221 frames, against the 90s default idle bound.
+
+### `mimo-v2.6-flash`
+
+Measured on 2026-09-22.
+
+| bit | value | probe |
+|---|---|---|
+| `vision` | **true** | `MiMoImageInput` |
+| `max_tokens_param` | **both accepted and honoured** | `OutputCapParameter` |
+| `reasoning.can_be_disabled` | **true** | `MiMoThinkingCanBeDisabled` |
+| `reasoning.enabled_by_default` | **true** | `MiMoThinkingCanBeDisabled` |
+| `reasoning.effort_values` | **low, medium, high** (`xhigh` a 400) | `MiMoReasoningEffortValues` |
+| `needs_include_usage` | **false** | `UsageReportingWithoutStreamOptions` |
+| `json_object` / `json_schema` / `strict_schema` | **true** | `ResponseFormatSupport` |
+| tool-call format | **native** | `MiMoToolCallFormat` |
+| usage containment | **cached inside prompt** | `CachedTokensAreInsidePromptTokens` |
+
+Every bit matches `-pro` except the ones below. The thinking toggle is honoured
+independently here too: reasoning tokens 42 with no knob, 0 with the toggle.
+
+**Disabling thinking made it answer incorrectly, every time it was asked.**
+With `thinking: disabled` it returned `155`, `145` and `195` across three runs
+of a one-step arithmetic prompt whose answer is `205`, and the correct answer
+with thinking on. `-pro` answered correctly with thinking off in all three. See
+the "Still open" bullet: three distinct wrong answers reads as guessing rather
+than as a coin landing badly, and makes `ReasoningOff()` a quality decision on
+this model.
+
+**`max_output` moved 4x across the version bump.** `mimo-v2.5` shipped 32768;
+this model's card documents 128K, the same ceiling as `-pro`. Not measured — no
+probe sent a cap above the ceiling, and every endpoint measured so far clamps
+silently.
+
+**Fastest endpoint in this file**: 0.9-2.6 seconds per call, longest
+comment-only gap 522ms over 353 frames.
+
+**A deep pass outlasts the default reasoning allowance.** Observed in
+production on 2026-10-25, long-form summaries with no knob sent and a 4096-token
+answer: the wire cap was 5120 (`DefaultReasoningOverhead` 1024 added), and two
+calls in ten ended `finish_reason: length` with 5089 and 5126 reasoning tokens
+and 119 and 0 chars of content. Both were cut, so the true depth is unknown.
+`reasoning.overhead.default` is 8192 from here: a budget above that floor, kept inside the 15-minute call bound at 18 tok/s.
+
+**A stray `</think>` in content, with thinking disabled.** Observed once in
+production on 2026-09-22, never by a probe: a tool-free call after a
+multi-turn tool history, `thinking: disabled`, 0 reasoning tokens, came back
+with a draft of the answer, a closing `</think>` and then the answer, all in
+`content`. No opening tag, nothing on the reasoning channel. The caller parsed
+the draft as the answer. `reasoning.leaks_close_tag` makes `Chat` cut content
+at the first such tag and move the draft to `Reasoning`, with a warning, on
+requests with thinking off and no JSON format, before inline tool-call
+recovery.
+Streams are not covered: the draft is already sent when the tag arrives. Not
+seen on `-pro`.
+
+**Parallel tool calls without bound.** The same deployment answered one tool
+round with 38 `tool_calls` under `tool_choice: auto` and ran into a 700-token
+`max_tokens`, `finish_reason: length`, the last call's arguments cut mid-JSON.
+Parallel calls are real on this model; a caller capping a tool turn should cap
+the calls it runs too.
+
+### `reasoning_effort` on the V2.6 pair: the ladder is not a ladder
+
+Measured 2026-09-22 by `MiMoEffortLadderIsReal`, five samples per level on a
+variable-depth prompt ("list every prime number between 100 and 200"), which
+replaced the one-step arithmetic prompt that produced the earlier n=1 reading.
+Reasoning tokens:
+
+| level | `mimo-v2.6-pro` | `mimo-v2.6-flash` |
+|---|---|---|
+| none sent | 104-656, mean 254.6 | 117-1784, mean 451.0 |
+| `low` | 120-507, mean 198.2 | 104-121, mean 115.2 |
+| `medium` | 120-148, mean 125.8 | 117-121, mean 118.6 |
+| `high` | 104-1088, mean 337.8 | 104-117, mean 111.8 |
+
+**Every range overlaps every other, on both models.** On `-flash` the three
+levels span 17 tokens between them and `high` has the *lowest* mean of the
+three — there is no trend to be noisy around.
+
+**Read the samples, not the means.** `-pro`'s means look directional (338 for
+high against 198 for low) and that is an artefact. The raw draws are
+`[121 255 121 1088 104]` for high and `[121 507 120 122 121]` for low: four of
+five samples at every level sit in a ~104-150 band, and the mean is decided by
+whether that level happened to draw one outlier. What varies is not the level.
+It is whether the deployment takes a deep pass on a given call. The same
+applies to `-flash`'s no-level mean of 451, which is one 1784-token draw in
+five whose other four samples sit at 117-120.
+
+So a caller gets **a floor with occasional deep thinks, not three settings**.
+`effort_values` stays `[low, medium, high]` because the endpoint enforces that
+set and `xhigh` is a 400 — the profile describes the wire — but the thinking
+toggle is the control that works.
+
+**The earlier suppression reading does not reproduce.** At n=1 every level on
+`-pro` appeared to reason *less* than sending no level (67/69/74 against 197),
+which suggested `reasoning_effort` was a second disable switch. At n=5 the
+no-level range (104-656) overlaps every level. This is the reason the profile
+comments now carry ranges and raw draws rather than point figures.
+
+### The thinking toggle wins over an effort level
+
+`MiMoThinkingToggleBeatsEffort`, one call per model: `thinking: {"type":
+"disabled"}` and `reasoning_effort: "high"` sent in the same request are not
+refused, and the toggle wins — reasoning tokens 0 on both. A caller that
+disables thinking while also passing an effort gets what it asked for, so
+`ReasoningOff()` needs no special handling to strip the level.
+
+### `claude-opus-5-5`
+
+Measured on 2026-10-26 against `api.anthropic.com/v1`, `anthropic-version:
+2026-10-21`, through `FromEnv` (`eval_messages_test.go`). The first profile on
+Anthropic's Messages protocol (`wire_api: messages`).
+
+| bit | value | probe |
+|---|---|---|
+| `reasoning.effort_values` | **low, medium, high, xhigh, max**; `none` and `minimal` a 400 | `OpusEffortLadder` |
+| `reasoning.can_be_disabled` | **false**: `thinking.type` `disabled` and `enabled` (budget) a 400 | `OpusRefusals` |
+| `temperature` / `top_p` | **unsupported**: "Extra inputs are not permitted", 400 | `OpusRefusals` |
+| `tool_choice_values` | **auto, none**: `any` and `tool` a 400 | `OpusRefusals` |
+| `json_schema` | **true**, the reply parsed | `OpusStructuredOutput` |
+| usage containment | **cache BESIDE input_tokens** | `OpusCacheContainment` |
+| `limits` | **1,000,000 / 128,000**, from the models listing | `OpusModelsListing` |
+| uncapped call | **accepted** at `max_tokens` 128000, non-streamed | `OpusBasics` |
+
+Every refusal is `400 invalid_request_error`; the error body is
+`{"type":"error","error":{"type":…,"message":…}}`, and `error.type` becomes
+`APIError.Code`. An unknown model is `404 not_found_error`. Verbatim: `"thinking.type.disabled" is not
+supported for this model. Use "thinking.type.adaptive" and
+"output_config.effort" to control thinking behavior.`; `tool_choice: type
+"tool" and "any" are not supported for this model.`
+
+**Cache tokens sit beside `input_tokens`, the reverse of the OpenAI shape.**
+An 11215-token system prompt under top-level `cache_control` reported
+`input_tokens` 4 with `cache_creation_input_tokens` 11215, then `input_tokens`
+4 with `cache_read_input_tokens` 11215 on the identical second call. Priced
+0.056171 and 0.002339 USD: the write lane at the 5-minute rate, the read at
+0.05x. So `Input.Total` is built by adding the three lanes, never by
+subtracting.
+
+**Usage reports thinking.** `output_tokens_details.thinking_tokens`, inside
+`output_tokens`, maps to `Output.Reasoning`. A trivial prompt thinks 0 tokens
+at every level from `low` to `xhigh`, 30 at `max`.
+
+**A deep think fills the cap.** With `display: summarized` at effort `high`, a
+counting problem streamed 1144 `thinking_delta` frames over 2m40s and stopped
+at `max_tokens` 16000 with all 16000 output tokens thinking and no answer. The
+longest gap between non-ping frames was 4.8s, and only ONE `ping` arrived in
+the whole stream, so the idle guard is fed by the thinking summary, never by
+heartbeats (`OpusStreamFrames`). `DefaultReasoningOverhead` is far short at
+`high` and above: `MaxAnswerTokens` with a small answer can return `length` and
+no content until an overhead is measured.
+
+**Thinking replay.** Round 1 of the tool loop returned a signed `thinking`
+block and a `tool_use`; round 2 with `resp.Assistant()` answered. A
+hand-built assistant turn carrying only the `tool_use`, no thinking block, was
+ACCEPTED too, as was the replay of a streamed turn (`OpusToolLoop`).
+
+**Conversation shapes** (`OpusConversationShapes`): ending on an assistant
+turn is a 400, "This model does not support assistant message prefill. The
+conversation must end with a user message." (`assistant_prefill: false`).
+Opening on one, and two assistant turns in a row, were accepted. A
+whitespace-only text block is a 400, "text content blocks must contain
+non-whitespace text", where Chat Completions takes it: plan refuses such a
+turn by index rather than dropping it, since a drop reshapes the history into
+another 400 (a prefill, a tool_use not followed by its result). A
+`tool_result` whose content is whitespace or empty was accepted, tools
+defined, so tool turns are sent as they are. User text ahead of the
+`tool_result` in one turn is a 400, "`tool_use` ids were found without
+`tool_result` blocks immediately after"; plan refuses user content between a
+call and its results by index. An assistant turn there was accepted: the
+endpoint joins consecutive assistant turns. With real signed thinking
+(`OpusSignedJoins`, same effort as the replayed turns): a plain note after a
+replayed calling turn was accepted; a replayed turn sent twice was a 400,
+"Invalid `signature` in `thinking` block. The block is bound to a different
+conversation." Plan does not refuse it: it cannot tell an edited history from
+a genuine one (another model's replies, a turn with no signed block), so the
+endpoint's 400 comes back as that APIError.
+
+Not measured: vision, parallel tool calls, a stop sequence.
+
+## Where the documentation is wrong
+
+| claim | source | measured |
+|---|---|---|
+| `thinking: {"type":"disabled"}` is valid on `glm-5.3-flash` | Z.ai API reference | **refused, code 1210** |
+| `json_schema` unsupported on Z.ai | Z.ai OpenAPI enum and docs | **accepted and honoured** |
+| `json_schema` unsupported on MiMo | vendor documents `json_object` only | **accepted and honoured** |
+| Z.ai does not accept `stream_options` | absent from its request schema | **accepted** (and unnecessary) |
+| MiMo takes `max_completion_tokens`, not `max_tokens` | inferred from a prior measurement | **both honoured** |
+| code 1210 means "invalid API parameter" | Z.ai error table | correct but useless: it is returned for at least two unrelated conditions |
+| `mimo-v2.6-*` input modality is text | vendor model card **specification table**, and OpenRouter | **image input accepted** — the prose on the same card ("Omni-Modal Understanding") is the correct half |
+| `mimo-v2.6-flash` inherits V2.5's 32768 output ceiling | inferred from the V2.5 entry | **131072**, per the card; the ceiling moved 4x at the version bump |
+| a published catalogue can price `mimo-v2.6-*` | models.dev | **no v2.6 entry exists at all** (2026-09-22); the vendor page is the only source, with no cross-check |
+| the vendor page carries USD rates for `mimo-v2.5*` | the `source_url` both V2.5 entries cite | **it no longer does**: the Overseas (USD) table lists only V2.6 ids, V2.5 survives only in the domestic RMB table marked "(deprecated)" |
+| `reasoning_effort` is a Responses-API parameter | vendor documentation, all MiMo models | **accepted on chat/completions with an enforced set**; `xhigh` is a 400 |
+
+Two further notes on error handling, both of which changed the code:
+
+- **The 1210 message arrived in English.** Prior evidence had it in Chinese. The
+  text varies; only the code is stable. This is the strongest argument yet for
+  dispatching on `code` and never on message prose.
+- **MiMo returns SSE-framed error bodies under non-2xx statuses.** The image 404
+  body was the single line `data:{"error":{...}}`. The envelope parser now
+  unwraps a leading `data:` frame, or the code would have been lost to raw text
+  on exactly the failures that matter most.
+
+## Cost observations
+
+Prompt caching is live and visible on MiMo: a 258-token prompt reported
+`cached_tokens: 192`. That matches the documented behaviour where the endpoint
+injects its own system message when none is supplied, most of it served from
+cache. It also means the cache-read lane is not theoretical on this endpoint and
+must be priced separately from the first call onward.
+
+`glm-5.3-flash` reported `cached_tokens: 0` throughout, on prompts too short to
+reach any cache minimum.
+
+**Cached tokens are INSIDE `prompt_tokens` on both vendors** (measured
+2026-09-13, `TestProbe_CachedTokensAreInsidePromptTokens`). The same ~10k-token
+prompt sent twice, five seconds apart:
+
+| model | call 1 prompt / cached | call 2 prompt / cached |
+|---|---|---|
+| mimo-v2.5-pro | 11131 / 192 | 11131 / 11072 |
+| glm-5.3-flash | 9208 / 0 | 9208 / 9152 |
+
+`prompt_tokens` did not move while `cached_tokens` grew to nearly all of it, so
+the full-rate lane is `prompt_tokens - cached_tokens` and pricing subtracts
+correctly. Had a vendor reported cached tokens beside `prompt_tokens`, the
+subtraction would under-count the full-rate lane, which is the one direction a
+budget cap cannot tolerate; that is now ruled out for both. Z.ai's field is
+confirmed as `prompt_tokens_details.cached_tokens`, and its cache is live: this
+was the first non-zero value seen from it.
+
+The original run — every probe above the containment table — cost **30 calls
+and roughly $0.008** at conservative upper-bound rates. The containment probe
+adds **4 calls and roughly $0.025** per run, nearly all of it the ~10k-token
+prompt sent twice per vendor. Both well inside the $0.50 circuit breaker.
+
+The 2026-09-22 V2.6 onboarding run added the two new ids to every MiMo probe
+table, so it re-ran the V2.5 rows as controls: **about 63 calls and roughly
+$0.065** across nine separate invocations, of which the containment probe alone
+was $0.053. The Z.ai rows skipped for want of a key. Well inside the breaker
+again, and the whole run fit the default 10-minute deadline per invocation
+because V2.6 answers in 1-5 seconds where V2.5-pro took 25-64.
+
+The same run showed `mimo-v2.5-pro` answering in **3.5-18 seconds**, not the
+25-64 recorded on 2026-09-12. Its `notes` carried the old figure until the
+entry was retired on 2026-10-31; the latency class of that endpoint had
+evidently improved and was never re-probed deliberately.
+
+Settling the effort ladder cost a further **46 calls and roughly $0.034**:
+40 for `MiMoEffortLadderIsReal` (four levels, five samples, two models, on a
+prompt that produces real reasoning rather than the ~10 tokens the arithmetic
+prompt drew), 4 to re-confirm the thinking toggle after fixing a nil-versus-zero
+bug in its own probe, and 2 for `MiMoThinkingToggleBeatsEffort`.
+
+`defaultMaxCalls` moved 60 -> 160 at the same time. With four MiMo models in the
+per-model tables a full `-run Probe` sweep is ~75 calls before the ladder probe's
+40, so the documented command was dying partway at the old ceiling and reading as
+a harness failure rather than as the guard working. The USD breaker is unchanged
+and is what bounds real spend: a full sweep is about $0.10 against $0.50.
+
+The 2026-11-01 overhead runs (`ZaiReasoningOverhead`, opt-in through
+`LLMWIRE_EVAL_OVERHEAD=1`) were **60 calls in two runs of 30, roughly $0.134**
+at the full input rate, prefix-cache hits ignored (both levels of a sample sent
+the same prompt, so the real bill is likely lower): run 1 261748 prompt and 48992 completion tokens, ~$0.064,
+878 seconds; run 2 310914 prompt and 47203 completion tokens, ~$0.070, 759
+seconds. 7-86 seconds per call, the deep `high` pass on a 20k prompt the
+slowest. Each ran alone under `LLMWIRE_EVAL_MAX_CALLS=30`, a raised
+`LLMWIRE_EVAL_DEADLINE` and `-timeout`.
+
+## Still open
+
+- **Everything LiteLLM.** No instance was reachable. Header names, the cost-header
+  parsing and the error shapes remain source-derived at v1.100.1 and unverified.
+- ~~**Token Plan credit rates.**~~ **Closed by policy, not by measurement.** Credits
+  are not converted at all: llmwire reports the vendor's published pay-as-you-go USD
+  rate for every model, including one reached over a Token Plan host, and labels it
+  a list-rate equivalent rather than an invoice. The MiMo rates in `profiles.yaml`
+  come from the vendor's own page (0.435/0.87 for `mimo-v2.5-pro`, contradicting a
+  third-party doc's 1.00/3.00). What a credit invoice actually charges is still
+  unknown and is now deliberately out of scope.
+- **Whether off-peak multipliers apply to the USD lane** as well as to credit
+  burn. Both vendors document them as credit coefficients.
+- **Whether inline tool markup can still appear at all.** Neither probe
+  reproduced it, but neither reproduced loom's exact conditions either: a long,
+  tool-saturated history in production. Recovery is on for the MiMo profiles;
+  the `tool_calls` warning it emits is how a recurrence gets noticed.
+- ~~**What `reasoning_effort` actually does on the V2.6 pair.**~~ **Closed
+  2026-09-22 by measurement: the ladder is not a ladder.** See the
+  `reasoning_effort` section below.
+- **`stream_field` on the V2.6 pair.** Left at the load default. `stream.go` reads
+  both `reasoning_content` and `reasoning` with content winning, so which key the
+  delta carried cannot be read back out of a `StreamResult`; confirming it needs a
+  spooled raw stream.
+- **`temperature.inert_while_reasoning` on the V2.6 pair.** Absent rather than
+  carried over from V2.5. That bit rests on a vendor statement that the model
+  forcibly overrides both sampling parameters while thinking, and no V2.6 source
+  repeating it has been found; the vendor's API docs are JS-rendered and were not
+  machine-readable. `supported: true` is kept so a caller sending either is not
+  refused.
+- **`tool_choice` and parallel tool calls on the V2.6 pair.** No probe offered a
+  forced choice or two tools in one turn to any MiMo endpoint. Both entries carry
+  the family's documented values (`auto` only, no forced choice, parallel
+  supported); `tool_choice_values` cannot be empty while tools are supported, so
+  these are the doc's values rather than an absence.
+- **Whether the V2.6 thinking toggle behaves the same on the V2.5 pair.**
+  `MiMoThinkingCanBeDisabled` covers the V2.6 ids only. Adding the two V2.5 rows
+  would close a bit those entries have carried on documentation since they
+  shipped — about four calls — but they are deprecated on 2026-10-21.
+- **Whether disabling thinking systematically degrades `-flash`.** Three
+  samples now, and **three for three wrong**: the same one-step arithmetic
+  prompt (answer 205) returned **155**, **145** and **195** with thinking
+  disabled, a different wrong number each time, and the correct answer with
+  thinking on. `-pro` answered correctly with thinking off in all three. Three
+  draws is not a study, but three distinct wrong answers is not a coin landing
+  badly either — with thinking off this model appears to guess at one-step
+  arithmetic. `ReasoningOff()` against `-flash` is a quality decision. An
+  accuracy comparison over a prompt set would quantify it.

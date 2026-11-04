@@ -1,0 +1,367 @@
+package llmwire
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"sync"
+	"time"
+)
+
+// The streaming call, as an iterator.
+//
+// An iterator rather than a pair of channels. A channel pair cannot be closed
+// cleanly when the caller returns early, and it leaves Usage() — which only exists
+// once the final chunk has arrived — with nowhere to live.
+//
+// Everything that can fail BEFORE the first byte fails synchronously, on the
+// calling goroutine: the refusal, the render, the dial, the status. So a validation
+// error, a 401 and a rate limit all arrive as the third return value rather than
+// being buried in Err() after a pointless Next().
+
+// EventKind says which channel an event came from.
+type EventKind string
+
+// The channels a stream event can arrive on.
+const (
+	EventContent   EventKind = "content"
+	EventReasoning EventKind = "reasoning"
+	EventToolCall  EventKind = "tool_call"
+	EventFinish    EventKind = "finish"
+)
+
+// StreamEvent is one increment of a streamed answer.
+//
+// Tool calls arrive as FRAGMENTS keyed by Index: the id and name come on the first
+// one and the arguments build up as text across the rest. Assembled calls are on
+// Result() once the stream ends, so a caller who only wants the finished calls
+// need not reassemble them.
+type StreamEvent struct {
+	Kind EventKind
+	// Text is the content or reasoning delta.
+	Text string
+	// Index, ID, Name and ArgumentsDelta describe a tool-call fragment. ID and
+	// Name are present on the first fragment only.
+	Index          int
+	ID             string
+	Name           string
+	ArgumentsDelta string
+	// FinishReason is the endpoint's own string, treated as an open set.
+	FinishReason string
+}
+
+// Stream is a live streamed completion. Close it when done; a deferred Close is
+// always correct, including after reading to the end.
+type Stream struct {
+	client *Client
+	// ctx is the caller's, kept so a genuine parent cancellation stays
+	// distinguishable from this package's own bounds.
+	ctx context.Context
+	*streamExchange
+
+	// queue is UNBOUNDED, and that is the load-bearing decision in this file.
+	//
+	// The reader must never block. It re-arms the idle guard on each data frame,
+	// so a hook that waited for a slow consumer would stop re-arming it and the
+	// call would die reporting "stream idle" while the model was producing
+	// perfectly — the exact misattribution the named bounds exist to prevent. An
+	// unbounded queue costs nothing here: readStream already accumulates the whole
+	// content and reasoning in memory regardless of the consumer, so the deltas
+	// are held either way.
+	mu     sync.Mutex
+	cond   *sync.Cond
+	queue  []StreamEvent
+	closed bool // the reader has finished; no more events will arrive
+	// stopped records a caller-initiated Close, so the cancellation it causes is
+	// not reported as a timeout.
+	stopped bool
+
+	cur      StreamEvent
+	res      StreamResult
+	err      error
+	warnings []Warning
+	done     chan struct{}
+	closeOne sync.Once
+}
+
+// ChatStream starts a streaming completion.
+//
+// The returned warnings are the VALIDATION warnings, available before any byte is
+// consumed so a caller who wants to abort on a coercion can. Pricing cannot run
+// until usage arrives, so the complete set — validation plus pricing — comes from
+// Warnings() after Next() returns false.
+func (c *Client) ChatStream(ctx context.Context, req ChatRequest) (*Stream, []Warning, error) {
+	if c.routes != nil {
+		return c.routedChatStream(ctx, req)
+	}
+	pl, warnings, err := c.plan(req, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	sum := callSummary{kind: "chat_stream", model: req.Model, plan: pl, warnings: warnings}
+	body, err := pl.render()
+	if err != nil {
+		sum.err = err
+		c.finish(sum)
+		return nil, warnings, err
+	}
+	at := c.now()
+
+	x, timing, hdr, err := c.openStream(ctx, pl.route(), body)
+	if err != nil {
+		// The proxy's call id is worth most on a rejection: it is what
+		// matches this failure to the gateway's own log.
+		sum.gateway, _ = parseGatewayHeaders(hdr)
+		sum.err, sum.timing = err, timing
+		c.finish(sum)
+		return nil, warnings, err
+	}
+
+	s := &Stream{
+		client:         c,
+		ctx:            ctx,
+		streamExchange: x,
+		// The caller's slice and the stream's are separate allocations: the
+		// reader appends pricing warnings to s.warnings later, and a shared
+		// backing array would let that append write into a slice the caller
+		// may be appending to at the same moment.
+		warnings: slices.Clone(warnings),
+		done:     make(chan struct{}),
+	}
+	s.cond = sync.NewCond(&s.mu)
+
+	go s.read(pl, at)
+	return s, warnings, nil
+}
+
+// read consumes the stream on its own goroutine and publishes the result.
+func (s *Stream) read(pl *wirePlan, at time.Time) {
+	resp := s.resp
+	bounds := streamBounds{idle: s.client.idle, toolIdle: pl.req.ToolCallIdleTimeout}
+	var (
+		res            StreamResult
+		inlineWarnings []Warning
+		err            error
+	)
+	switch {
+	case pl.responses():
+		res, err = readResponsesStream(resp.Body, s.guard, bounds, s.push, s.client.redact, s.client.now, s.start)
+	case pl.messages():
+		res, err = readMessagesStream(resp.Body, s.guard, bounds, s.push, s.client.redact, s.client.now, s.start)
+	default:
+		res, inlineWarnings, err = readStream(resp.Body, s.guard, bounds, s.push, s.client.redact,
+			pl.recoversInline(), s.client.now, s.start)
+	}
+	res.Timing.Headers = s.headers
+	res.ReasoningSent = reasoningLabel(pl.req.Reasoning)
+
+	_ = resp.Body.Close()
+	s.guard.stop()
+
+	s.mu.Lock()
+	guardFired, _ := s.guard.firedReason()
+	stopped := callerStopped(s.stopped, err, guardFired != "")
+	s.mu.Unlock()
+
+	// Headers were complete before the body was read, so the gateway block
+	// is filled whichever way the stream ended: a call that timed out or was
+	// cut is exactly the one whose call id has to reach the log.
+	var gwWarnings []Warning
+	res.Gateway, gwWarnings = parseGatewayHeaders(resp.Header)
+	switch {
+	case stopped:
+		err = nil
+	case err != nil:
+		err = s.client.explain(s.ctx, s.callCtx, s.guard, err)
+	}
+	// Released once explain has read them, so a caller who drains the stream
+	// without Close does not keep the call-cap timer alive. Close stays a no-op
+	// on them.
+	s.release()
+	// Priced however the stream ended. A caller who Closes after EventFinish
+	// has, on an endpoint that sends usage in the finish chunk, already
+	// received the figures; and a stream cut after its usage frame was paid
+	// for. Where nothing arrived priceCall says Unpriced with a warning, which
+	// is the contract: a zero cost is never silent.
+	//
+	// The header lane is withheld unless the stream ended cleanly. A proxy
+	// writes x-litellm-response-cost before the body, and on a stream has
+	// shipped it as a literal 0; on a clean ending that hole is the documented
+	// one, but on a stream that stalled or was Closed the header cannot
+	// describe the call at all, and pricing it would record a confident zero
+	// for exactly the call that was cut. usage.cost in the body, when it
+	// arrived, still counts.
+	hdr := resp.Header
+	if stopped || err != nil {
+		hdr = nil
+	}
+	var priceWarnings []Warning
+	res.Usage.Cost, priceWarnings = priceCall(pl.profile, res.Usage, hdr, resp.StatusCode, at)
+	priceWarnings = append(priceWarnings, gwWarnings...)
+
+	// Reported from the locals: s.res and s.err are written under the mutex
+	// below, and the caller may already be reading them.
+	warnings := append(append(append([]Warning(nil), s.warnings...), inlineWarnings...), priceWarnings...)
+	s.client.finish(callSummary{kind: "chat_stream", model: pl.req.Model, plan: pl,
+		content: len(res.Content), reasoning: len(res.Reasoning), toolCalls: len(res.ToolCalls),
+		finishReason: res.FinishReason, usage: res.Usage, timing: res.Timing,
+		gateway: res.Gateway, warnings: warnings, err: err, closed: stopped})
+
+	s.mu.Lock()
+	// Written under the mutex, all of it. Warnings() is documented as readable
+	// while the stream is still running — it returns the validation warnings until
+	// the pricing ones arrive — so appending outside the lock is a real race
+	// against a caller polling it, not a theoretical one.
+	//
+	// Written before the reader is marked finished, and read only after Next has
+	// observed that flag, so the mutex also carries the happens-before edge for
+	// res and err.
+	s.warnings = append(s.warnings, inlineWarnings...)
+	s.warnings = append(s.warnings, priceWarnings...)
+	s.res, s.err = res, err
+	s.closed = true
+	s.cond.Broadcast()
+	s.mu.Unlock()
+	close(s.done)
+}
+
+// callerStopped says whether a stream's ending was the caller's Close and
+// nothing else. A Close cancels the request, and explain() would report that
+// cancellation as "exceeded the call cap", a timeout that never happened; the
+// truncation guard's "ended without finish_reason" is equally wrong, since the
+// caller stopped reading on purpose. So only an ending the Close could have
+// caused counts: a cancellation, with the stall guard silent. Everything else
+// is kept whatever Close did, because Close can land after the fact: a stream
+// the endpoint already failed (an error frame, a cut body) is a failure, a
+// stream the guard already cancelled is the stall it names (the guard cancels
+// with the same context.Canceled a Close does), and a stream that ran to its
+// end is clean, with its header lane intact.
+func callerStopped(stopped bool, err error, guardFired bool) bool {
+	return stopped && err != nil && errors.Is(err, context.Canceled) && !guardFired
+}
+
+// push queues one event. Called on the reading goroutine and must never block.
+func (s *Stream) push(ev streamEvent) {
+	out := StreamEvent{}
+	switch ev.kind {
+	case evContent:
+		out.Kind, out.Text = EventContent, ev.text
+	case evReasoning:
+		out.Kind, out.Text = EventReasoning, ev.text
+	case evToolCall:
+		out.Kind = EventToolCall
+		out.Index = ev.toolCall.Index
+		out.ID = ev.toolCall.ID
+		out.Name = ev.toolCall.Function.Name
+		out.ArgumentsDelta = ev.toolCall.argumentsDelta()
+	case evFinish:
+		out.Kind, out.FinishReason = EventFinish, ev.finishReason
+	}
+
+	s.mu.Lock()
+	s.queue = append(s.queue, out)
+	s.cond.Signal()
+	s.mu.Unlock()
+}
+
+// Next advances to the next event, blocking until one arrives. It returns false
+// when the stream is finished or has failed; check Err afterwards.
+func (s *Stream) Next() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.queue) == 0 && !s.closed {
+		s.cond.Wait()
+	}
+	if len(s.queue) == 0 {
+		return false
+	}
+	s.cur = s.queue[0]
+	s.queue = s.queue[1:]
+	return true
+}
+
+// Event returns the event Next advanced to.
+func (s *Stream) Event() StreamEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cur
+}
+
+// Err returns why the stream ended, or nil. Valid once Next has returned false.
+//
+// A failure names the bound that gave up — "stream idle for 1m30s", "exceeded the
+// 15m0s call cap" — rather than surfacing a bare context error, and a stream that
+// ended without [DONE] or a finish_reason is an error rather than a short answer: a
+// dropped connection looks exactly like a finished one otherwise.
+func (s *Stream) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// Collect drains the stream: every content delta goes to onDelta as it
+// arrives, in order, and the assembled result comes back once the stream
+// ends. It is the loop every consumer that does not need the event kinds was
+// writing by hand — Next, switch on Kind, keep the finish reason, then read
+// Usage — and getting subtly different: one forgot the usage frame follows
+// the finish, another read Usage before Next returned false.
+//
+// The result is returned WITH the error. A stream cut after its usage frame,
+// or after content the reader has already seen, was paid for; a caller that
+// accounts per call needs the figures whether or not the read completed, and
+// gates on Usage.Total() — Reported() is true for an object with nothing
+// countable in it. onDelta may be nil.
+func (s *Stream) Collect(onDelta func(string)) (StreamResult, error) {
+	for s.Next() {
+		if ev := s.Event(); ev.Kind == EventContent && ev.Text != "" && onDelta != nil {
+			onDelta(ev.Text)
+		}
+	}
+	return s.Result(), s.Err()
+}
+
+// Result returns the accumulated answer: content, reasoning, assembled tool calls,
+// finish reason and usage. Valid once Next has returned false.
+func (s *Stream) Result() StreamResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.res
+}
+
+// Usage returns the token accounting and its cost. Valid once Next has returned
+// false — usage arrives in the final or trailing chunk, so mid-stream it is the
+// zero Usage, which reads as "not reported" rather than as zero tokens.
+func (s *Stream) Usage() Usage {
+	return s.Result().Usage
+}
+
+// Warnings returns the validation warnings plus anything the stream produced as it
+// finished, which in practice means pricing. It is the union, not only the late
+// ones, so a caller who checks one place gets everything.
+func (s *Stream) Warnings() []Warning {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A copy: the reader appends to s.warnings under the lock, and handing
+	// out the backing array would let a caller's append race that write.
+	return slices.Clone(s.warnings)
+}
+
+// Close stops the stream and releases its goroutine and connection.
+//
+// Idempotent, and correct to defer: a caller who read to the end gets a no-op, and
+// one who returns early gets a cancelled request. A deliberate close is not an
+// error, so Err stays nil for it, unless the endpoint or a bound had already
+// failed the stream before the Close landed: that failure is still reported.
+func (s *Stream) Close() error {
+	s.closeOne.Do(func() {
+		s.mu.Lock()
+		s.stopped = true
+		s.mu.Unlock()
+
+		// Cancelling reqCtx unblocks the body read the goroutine is sitting in.
+		s.cancelReq()
+		<-s.done
+		s.release()
+	})
+	return s.Err()
+}
