@@ -1,8 +1,12 @@
 name: Release
 
-# By hand only (Actions minutes): gh workflow run Release -f bump=patch. auto: patch, or what the commits since the
-# last tag ask for (Release: minor|major).
+# By hand: gh workflow run Release -f bump=patch. auto: patch, or what the commits since the last tag ask for
+# (Release: minor|major). A merged Dependabot module bump (go.mod/go.sum) releases by itself with auto: public repo,
+# free minutes, and consumers get the fixed dependency without waiting for the next release by hand.
 on:
+  push:
+    branches: [master]
+    paths: [go.mod, go.sum]
   workflow_dispatch:
     inputs:
       bump:
@@ -13,8 +17,10 @@ on:
 
 jobs:
   release:
+    # A squash merge is authored by the merger; Dependabot's sign-off in the message is what marks its PR.
+    if: "github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'Signed-off-by: dependabot[bot]')"
     uses: trick77/ship/.github/workflows/release.yaml@master
     with:
-      bump: ${{ inputs.bump }}
+      bump: ${{ inputs.bump || 'auto' }}
     permissions:
       contents: write

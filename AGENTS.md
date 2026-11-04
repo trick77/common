@@ -13,5 +13,8 @@
 - Gate: `ship check` (`ship` is the `ship()` from ship's README).
 - Fresh clone: `ship hooks` before the first push (check, conform and init install it too); without the pre-push hook a push skips the gate.
 - Branch + PR, never push to `master`.
+- Release by hand (`gh workflow run Release -f bump=auto`), except a merged Dependabot go.mod/go.sum bump: that one
+  releases itself (release.yaml, a ship.yaml `scaffold` allow). User: dependabot "auto-releases", the rest stays manual.
+  A Dependabot release also ships whatever was merged since the last tag, at the bump its `Release:` lines ask for.
 - Commit subjects + PR titles: Go style `area: what` (`mcpserver: …`), gated by ship; release notes list them by area.
 - `.yaml`, never `.yml`.

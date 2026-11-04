@@ -2,3 +2,7 @@
 # A Go module: go get resolves only v-prefixed semver tags.
 tag_prefix: v
 visibility: public
+allow:
+  - rule: scaffold
+    path: .github/workflows/release.yaml
+    why: a merged Dependabot go.mod/go.sum bump releases by itself (public repo, free minutes); by hand otherwise
