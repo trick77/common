@@ -432,13 +432,14 @@ func TestChatStream_PricesAGatewayStreamFromTheUsageBody(t *testing.T) {
 // Without the field the call stays unpriced — never zero, and never the table
 // rate, which behind a gateway would be a confident figure for a call nobody
 // priced. This is intg's state until the gateway sets
-// include_cost_in_streaming_usage.
+// include_cost_in_streaming_usage. LiteLLM still sends its cost header on a
+// stream, as a literal 0: a clean ending must not read it either.
 func TestChatStream_AGatewayStreamWithoutTheFieldStaysUnpriced(t *testing.T) {
 	srv := sseServer(t, []string{
 		`data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`,
 		`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10}}`,
 		"data: [DONE]",
-	})
+	}, reply{header: map[string]string{litellmCostHeader: "0"}})
 	c := clientOn(t, srv.URL, Config{Registry: registryFrom(t, gatewayStreamDoc), CallTimeout: 20 * time.Second})
 	s, _, err := c.ChatStream(context.Background(), ChatRequest{Model: "m-via", Messages: []Message{User("hi")}})
 	if err != nil {
