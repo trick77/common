@@ -168,6 +168,9 @@ func (s *Stream) read(pl *wirePlan, at time.Time) {
 	// cut is exactly the one whose call id has to reach the log.
 	var gwWarnings []Warning
 	res.Gateway, gwWarnings = parseGatewayHeaders(resp.Header)
+	// The cost header describes no stream (see priceStream): its text must
+	// not reach a log line beside an Unpriced cost as if it were the figure.
+	res.Gateway.ResponseCost = ""
 	switch {
 	case stopped:
 		err = nil
@@ -181,22 +184,10 @@ func (s *Stream) read(pl *wirePlan, at time.Time) {
 	// Priced however the stream ended. A caller who Closes after EventFinish
 	// has, on an endpoint that sends usage in the finish chunk, already
 	// received the figures; and a stream cut after its usage frame was paid
-	// for. Where nothing arrived priceCall says Unpriced with a warning, which
-	// is the contract: a zero cost is never silent.
-	//
-	// The header lane is withheld unless the stream ended cleanly. A proxy
-	// writes x-litellm-response-cost before the body, and on a stream has
-	// shipped it as a literal 0; on a clean ending that hole is the documented
-	// one, but on a stream that stalled or was Closed the header cannot
-	// describe the call at all, and pricing it would record a confident zero
-	// for exactly the call that was cut. usage.cost in the body, when it
-	// arrived, still counts.
-	hdr := resp.Header
-	if stopped || err != nil {
-		hdr = nil
-	}
+	// for. Where nothing arrived priceStream says Unpriced with a warning,
+	// which is the contract: a zero cost is never silent.
 	var priceWarnings []Warning
-	res.Usage.Cost, priceWarnings = priceCall(pl.profile, res.Usage, hdr, resp.StatusCode, at)
+	res.Usage.Cost, priceWarnings = priceStream(pl.profile, res.Usage, resp.StatusCode, at)
 	priceWarnings = append(priceWarnings, gwWarnings...)
 
 	// Reported from the locals: s.res and s.err are written under the mutex
@@ -235,7 +226,7 @@ func (s *Stream) read(pl *wirePlan, at time.Time) {
 // the endpoint already failed (an error frame, a cut body) is a failure, a
 // stream the guard already cancelled is the stall it names (the guard cancels
 // with the same context.Canceled a Close does), and a stream that ran to its
-// end is clean, with its header lane intact.
+// end is clean.
 func callerStopped(stopped bool, err error, guardFired bool) bool {
 	return stopped && err != nil && errors.Is(err, context.Canceled) && !guardFired
 }

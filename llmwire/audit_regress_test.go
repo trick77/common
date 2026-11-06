@@ -452,8 +452,7 @@ func TestValidateStream_SeesTheStreamingRefusal(t *testing.T) {
 // A proxy writes its cost header before the body, and on a stream has
 // shipped it as a literal 0. A stream that was cut cannot be described by
 // that header at all, so pricing it would record a confident zero for
-// exactly the call that failed: the header lane is withheld unless the
-// stream ended cleanly.
+// exactly the call that failed: a stream never reads the header lane.
 func TestChatStream_CutGatewayStreamIgnoresTheCostHeader(t *testing.T) {
 	srv := sseServer(t, []string{`data: {"choices":[{"delta":{"content":"half"}}]}`},
 		reply{header: map[string]string{litellmCostHeader: "0"}})

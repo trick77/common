@@ -93,7 +93,8 @@ the provider's own timezone). Figures are always the vendor's published
 pay-as-you-go rate — a comparable equivalent, **not an invoice**, since a call
 routed over a subscription host is billed in plan credits nobody can compare
 across models. Behind a gateway the cost is what the proxy reports, on
-`usage.cost` in the body first and in its response header second, or nothing
+`usage.cost` in the body first and in its response header second (never on a
+stream, where the header is written before the body), or nothing
 at all. A rate we have not verified reports `Unpriced` and warns, because zero
 means unknown, not free. What else the proxy said rides on `ChatResponse.Gateway`
 / `StreamResult.Gateway` / `EmbedResponse.Gateway`: the call id it logged under, the deployment that

@@ -60,8 +60,10 @@ downgrade. Fully resolved at load: no call-site defaults.
 - **Always USD at the vendor's list rate**, plan credits too: an equivalent,
   **not an invoice**. No rate → `Unpriced` → 0 **with a warning**.
 - Behind a gateway: proxy's figure or nothing, never the table (`priceFromGateway`).
-  **Still unguarded**: header `0` with `include_cost_in_streaming_usage` OFF (the
-  default) records `Reported 0`; nothing distinguishes it from a free call.
+  A stream never reads the cost header: LiteLLM sends it as `0` before the
+  body, so with `include_cost_in_streaming_usage` OFF (the default) a clean
+  stream recorded `Reported 0`, a free call to every budget cap. `usage.cost`
+  or `Unpriced`.
 - **No off-peak window ships attached**: vendors document them against credit burn,
   not USD.
 
