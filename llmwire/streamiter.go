@@ -168,6 +168,9 @@ func (s *Stream) read(pl *wirePlan, at time.Time) {
 	// cut is exactly the one whose call id has to reach the log.
 	var gwWarnings []Warning
 	res.Gateway, gwWarnings = parseGatewayHeaders(resp.Header)
+	// The cost header describes no stream (see priceStream): its text must
+	// not reach a log line beside an Unpriced cost as if it were the figure.
+	res.Gateway.ResponseCost = ""
 	switch {
 	case stopped:
 		err = nil
@@ -181,18 +184,10 @@ func (s *Stream) read(pl *wirePlan, at time.Time) {
 	// Priced however the stream ended. A caller who Closes after EventFinish
 	// has, on an endpoint that sends usage in the finish chunk, already
 	// received the figures; and a stream cut after its usage frame was paid
-	// for. Where nothing arrived priceCall says Unpriced with a warning, which
-	// is the contract: a zero cost is never silent.
-	//
-	// A stream is never priced from the header. A proxy writes
-	// x-litellm-response-cost before the body, so on a stream it describes no
-	// call, and LiteLLM ships it as a literal 0: read on a clean ending, a
-	// gateway without include_cost_in_streaming_usage priced every streamed
-	// call a confident zero, and a budget cap on it never tripped. usage.cost
-	// in the body is the only lane; without it the call is Unpriced, with
-	// the warning naming the flag.
+	// for. Where nothing arrived priceStream says Unpriced with a warning,
+	// which is the contract: a zero cost is never silent.
 	var priceWarnings []Warning
-	res.Usage.Cost, priceWarnings = priceCall(pl.profile, res.Usage, nil, resp.StatusCode, at)
+	res.Usage.Cost, priceWarnings = priceStream(pl.profile, res.Usage, resp.StatusCode, at)
 	priceWarnings = append(priceWarnings, gwWarnings...)
 
 	// Reported from the locals: s.res and s.err are written under the mutex

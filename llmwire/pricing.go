@@ -509,6 +509,19 @@ func (b *CostBlock) validateWindows(bad func(string, ...any) error) error {
 	return nil
 }
 
+// priceStream prices a streamed call: priceCall without the header lane,
+// named so a stream path cannot hand it the response headers by accident.
+//
+// A proxy writes x-litellm-response-cost before the body, so on a stream it
+// describes no call, and LiteLLM ships it as a literal 0. Read on a clean
+// ending, a gateway without include_cost_in_streaming_usage priced every
+// streamed call a confident zero, and a budget cap on it never tripped.
+// usage.cost in the body is the only lane; without it the call is Unpriced,
+// the warning naming the flag.
+func priceStream(p *Profile, u Usage, status int, at time.Time) (Cost, []Warning) {
+	return priceCall(p, u, nil, status, at)
+}
+
 // priceCall prices one completed call.
 //
 // One entry point for both lanes, so the rule that a gateway route is NEVER
@@ -668,8 +681,9 @@ const litellmCostHeader = "x-litellm-response-cost"
 // costFromUsageBody reads the gateway's figure off the usage object itself.
 //
 // This is the only lane that can price a STREAM. The cost header is written
-// before the body is consumed, so on a streamed response it is absent (LiteLLM
-// issue #12689) — the gateway puts the number on usage.cost instead, behind
+// before the body is consumed, so on a streamed response it holds no figure
+// (absent, or LiteLLM's literal 0; issue #12689) and priceStream never reads
+// it — the gateway puts the number on usage.cost instead, behind
 // litellm_settings.include_cost_in_streaming_usage.
 //
 // json.Number, so the literal text reaches parseReportedCost and big.Rat converts
@@ -694,10 +708,9 @@ func costFromUsageBody(u Usage) (nano int64, ok bool, err error) {
 		return 0, false, nil
 	}
 	// RawMessage, not *json.Number: a STRING cost ("NaN", "abc") fails a Number
-	// decode, and treating that as "absent" hands the call to the header lane,
-	// where LiteLLM's "0" on a stream becomes a confident zero with no warning —
-	// precisely the figure this whole lane exists to refuse. Present in any shape
-	// means present; parseReportedCost decides whether it is usable.
+	// decode, and treating that as "absent" would hand a non-streamed call to the
+	// header lane, a figure the body contradicts, with no warning. Present in any
+	// shape means present; parseReportedCost decides whether it is usable.
 	raw := strings.TrimSpace(string(body.Cost))
 	if raw == "" || isJSONNull([]byte(raw)) {
 		return 0, false, nil
@@ -721,10 +734,10 @@ func costFromUsageBody(u Usage) (nano int64, ok bool, err error) {
 // a call nobody priced. Neither lane reporting degrades to Unpriced rather than
 // to a guess.
 //
-// The BODY wins over the header. On a stream the header cannot hold a real value,
-// and LiteLLM has shipped versions that send it as "0" there — recording that
-// would be a confident zero for the most expensive call in the turn. Where both
-// are real (a non-streamed call under include_cost_in_usage) they are the same
+// The BODY wins over the header. A stream never gets here with one
+// (priceStream: LiteLLM sends it as "0" there, a confident zero for the most
+// expensive call in the turn). Where both are real (a non-streamed call under
+// include_cost_in_usage) they are the same
 // number anyway.
 func priceFromGateway(p *Profile, u Usage, hdr http.Header, at time.Time) (Cost, []Warning) {
 	warn := func(format string, args ...any) (Cost, []Warning) {

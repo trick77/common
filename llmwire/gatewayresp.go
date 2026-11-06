@@ -58,7 +58,8 @@ type Gateway struct {
 	// ResponseCost is the per-call cost header verbatim, for a log line. The
 	// parsed figure is Usage.Cost; this is the text that produced it, or the
 	// literal "None" an older proxy sends for a deployment it cannot price,
-	// which is exactly what an operator needs to see.
+	// which is exactly what an operator needs to see. Always empty on a
+	// stream: the header there describes no call (priceStream).
 	ResponseCost string
 	// Cost is the proxy's split of that figure. Always empty on a stream,
 	// whatever the proxy sent: LiteLLM has shipped the stream's total header
