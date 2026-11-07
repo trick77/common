@@ -426,7 +426,8 @@ func TestHandler_binaryFileAsBlobResource(t *testing.T) {
 }
 
 // Binary files keep within MaxBlobBytes, text files within their own 3 MiB: a
-// full text budget does not take room from blobs, and blobs none from text.
+// full text budget does not take room from blobs, and blobs none from text. A
+// binary file without a type is left out and named.
 func TestHandler_blobsWithinTheirOwnBudget(t *testing.T) {
 	h := New(Server{Name: "t", MaxBlobBytes: 10, Tools: []Tool{{
 		Name: "mixed",
@@ -436,6 +437,7 @@ func TestHandler_blobsWithinTheirOwnBudget(t *testing.T) {
 				{Name: "full.csv", MimeType: "text/csv", Text: strings.Repeat("x", maxFilesBytes)},
 				{Name: "b.bin", MimeType: "application/octet-stream", Data: []byte("123456")},
 				{Name: "c.bin", MimeType: "application/octet-stream", Data: []byte("12")},
+				{Name: "untyped", Data: []byte("1")},
 			}}
 		},
 	}}})
@@ -451,7 +453,7 @@ func TestHandler_blobsWithinTheirOwnBudget(t *testing.T) {
 	if strings.Join(uris, " ") != "file:///a.bin file:///full.csv file:///c.bin" {
 		t.Errorf("resources = %v", uris)
 	}
-	if text := toolText(t, r); text != "here\n(not attached: b.bin (too large))" {
+	if text := toolText(t, r); text != "here\n(not attached: b.bin (too large), untyped (no type))" {
 		t.Errorf("text = %q", text)
 	}
 }
