@@ -6,6 +6,7 @@ package mcpserver
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,8 +18,8 @@ import (
 )
 
 const (
-	// maxBodyBytes bounds one request body; tool arguments are a few strings.
-	maxBodyBytes = 1 << 20
+	// defaultMaxBodyBytes bounds one request body; tool arguments are a few strings.
+	defaultMaxBodyBytes = 1 << 20
 	// defaultToolTimeout bounds one tool call: a calling client gives up at 30 s, this leaves room to still deliver
 	// a degraded answer or an error inside that.
 	defaultToolTimeout = 25 * time.Second
@@ -52,6 +53,9 @@ type Server struct {
 	ToolTimeout time.Duration
 	// MaxTextBytes caps one tool's text, cut at a line and marked; 0 is 24 KiB.
 	MaxTextBytes int
+	// MaxBodyBytes bounds one request body; 0 is 1 MiB. A tool that takes an
+	// image as an argument (base64) raises it.
+	MaxBodyBytes int
 	// AllowedOrigin is a base URL whose scheme://host[:port] is the one browser Origin accepted. Empty refuses
 	// every request that carries an Origin: server-to-server callers send none.
 	AllowedOrigin string
@@ -92,12 +96,24 @@ type File struct {
 	Text     string
 }
 
+// Image is a picture a tool returns as MCP image content. Meta, when set, describes it in
+// structuredContent.images at the image's position (loom reads filename, model, provider, width, height,
+// duration_ms there). The server does not cap images: the client caps a reply (loom only lets one through from a
+// server it allows to make artifacts), so a tool keeps its images within that.
+type Image struct {
+	MimeType string
+	Data     []byte
+	Meta     map[string]any
+}
+
 // Result is what a tool produced. Sources[i] belongs to the text's item i+1; nil Sources sends no
-// structuredContent, a non-nil empty slice an empty list.
+// structuredContent.sources, a non-nil empty slice an empty list. Images follow the text and files as image
+// blocks.
 type Result struct {
 	Text    string
 	Sources []Source
 	Files   []File
+	Images  []Image
 	IsError bool
 }
 
@@ -141,12 +157,16 @@ type handler struct {
 	ttlMs   int64
 	timeout time.Duration
 	maxText int
+	maxBody int
 }
 
 // New returns the endpoint's handler: origin check, then Auth, then method, size and JSON-RPC handling.
 func New(s Server) http.Handler {
 	h := &handler{s: s, origin: originOf(s.AllowedOrigin), tools: map[string]Tool{},
-		ttlMs: s.ToolsTTL.Milliseconds(), timeout: s.ToolTimeout, maxText: s.MaxTextBytes}
+		ttlMs: s.ToolsTTL.Milliseconds(), timeout: s.ToolTimeout, maxText: s.MaxTextBytes, maxBody: s.MaxBodyBytes}
+	if h.maxBody <= 0 {
+		h.maxBody = defaultMaxBodyBytes
+	}
 	if h.ttlMs <= 0 {
 		h.ttlMs = defaultToolsTTL.Milliseconds()
 	}
@@ -189,7 +209,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(h.maxBody)))
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -284,10 +304,27 @@ func (h *handler) callTool(w http.ResponseWriter, r *http.Request, req request, 
 	} else {
 		text = CapText(text, h.maxText)
 	}
-	content := []map[string]any{{"type": "text", "text": text}}
-	result := map[string]any{"content": append(content, files...)}
+	content := append([]map[string]any{{"type": "text", "text": text}}, files...)
+	structured := map[string]any{}
 	if res.Sources != nil {
-		result["structuredContent"] = map[string]any{"sources": res.Sources}
+		structured["sources"] = res.Sources
+	}
+	if len(res.Images) > 0 {
+		metas := make([]map[string]any, 0, len(res.Images))
+		for _, img := range res.Images {
+			content = append(content, map[string]any{"type": "image", "mimeType": img.MimeType,
+				"data": base64.StdEncoding.EncodeToString(img.Data)})
+			meta := img.Meta
+			if meta == nil {
+				meta = map[string]any{}
+			}
+			metas = append(metas, meta)
+		}
+		structured["images"] = metas
+	}
+	result := map[string]any{"content": content}
+	if len(structured) > 0 {
+		result["structuredContent"] = structured
 	}
 	if res.IsError {
 		result["isError"] = true

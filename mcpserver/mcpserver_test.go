@@ -101,7 +101,7 @@ func TestHandler_transportRules(t *testing.T) {
 	if code, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"ping","params":[1]}`, nil); code != http.StatusOK || r.Error.Code != codeInvalidParams {
 		t.Errorf("params array: %d", code)
 	}
-	big := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"p":"` + strings.Repeat("x", maxBodyBytes) + `"}}`
+	big := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"p":"` + strings.Repeat("x", defaultMaxBodyBytes) + `"}}`
 	if code, _, _ := call(t, h, big, nil); code != http.StatusRequestEntityTooLarge {
 		t.Errorf("size: %d", code)
 	}
@@ -361,6 +361,59 @@ func TestHandler_filesAsResourcesWithinTheCap(t *testing.T) {
 	}
 	if len(raw) > 4<<20 {
 		t.Errorf("response %d bytes, over 4 MiB", len(raw))
+	}
+}
+
+// Images go out as image blocks after the text and files, their meta in
+// structuredContent.images by position, next to the sources.
+func TestHandler_imagesAsContentWithMeta(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\nimage")
+	h := New(Server{Name: "t", Tools: []Tool{{
+		Name: "draw",
+		Run: func(context.Context, json.RawMessage) Result {
+			return Result{Text: "drawn", Sources: []Source{}, Images: []Image{
+				{MimeType: "image/png", Data: png, Meta: map[string]any{"filename": "fox", "width": 64}},
+				{MimeType: "image/jpeg", Data: []byte("jpg")},
+			}}
+		},
+	}}})
+	_, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"draw"}}`, nil)
+	content, _ := r.Result["content"].([]any)
+	if len(content) != 3 || toolText(t, r) != "drawn" {
+		t.Fatalf("content = %+v", content)
+	}
+	img := content[1].(map[string]any)
+	if img["type"] != "image" || img["mimeType"] != "image/png" || img["data"] != base64.StdEncoding.EncodeToString(png) {
+		t.Errorf("image block = %+v", img)
+	}
+	structured, _ := r.Result["structuredContent"].(map[string]any)
+	metas, _ := structured["images"].([]any)
+	if len(metas) != 2 || metas[0].(map[string]any)["filename"] != "fox" || len(metas[1].(map[string]any)) != 0 {
+		t.Errorf("images meta = %+v", structured["images"])
+	}
+	if sources, ok := structured["sources"].([]any); !ok || len(sources) != 0 {
+		t.Errorf("sources = %+v, want the empty list kept", structured["sources"])
+	}
+}
+
+// A result without sources or images sends no structuredContent.
+func TestHandler_noStructuredContentWithoutSourcesOrImages(t *testing.T) {
+	h := New(Server{Name: "t", Tools: []Tool{{Name: "plain", Run: func(context.Context, json.RawMessage) Result { return Result{Text: "x"} }}}})
+	_, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plain"}}`, nil)
+	if _, ok := r.Result["structuredContent"]; ok {
+		t.Errorf("structuredContent sent: %+v", r.Result)
+	}
+}
+
+// MaxBodyBytes lets a tool take an image as an argument; the default stays 1 MiB.
+func TestHandler_maxBodyBytes(t *testing.T) {
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"` + strings.Repeat("x", 2<<20) + `"}}}`
+	if code, _, _ := call(t, testHandler(), body, nil); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("default: status %d, want 413", code)
+	}
+	h := New(Server{Name: "t", Tools: []Tool{echoTool()}, MaxBodyBytes: 4 << 20})
+	if code, r, _ := call(t, h, body, nil); code != http.StatusOK || !strings.HasPrefix(toolText(t, r), "xxxx") {
+		t.Fatalf("raised: status %d", code)
 	}
 }
 
