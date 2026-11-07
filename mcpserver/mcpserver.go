@@ -5,14 +5,15 @@ package mcpserver
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,9 +54,9 @@ type Server struct {
 	ToolTimeout time.Duration
 	// MaxTextBytes caps one tool's text, cut at a line and marked; 0 is 24 KiB.
 	MaxTextBytes int
-	// MaxBodyBytes bounds one request body; 0 is 1 MiB. A tool that takes an
-	// image as an argument (base64) raises it.
-	MaxBodyBytes int
+	// MaxImageBytes bounds one result's images together; 0 is 3 MiB, so a reply stays under a 4 MiB client cap.
+	// A server whose client takes larger replies (loom's artifact servers) raises it.
+	MaxImageBytes int
 	// AllowedOrigin is a base URL whose scheme://host[:port] is the one browser Origin accepted. Empty refuses
 	// every request that carries an Origin: server-to-server callers send none.
 	AllowedOrigin string
@@ -77,7 +78,10 @@ type Tool struct {
 	Schema          map[string]any // input JSON schema; ObjectSchema builds the usual closed object
 	ReadOnly        bool           // annotations.readOnlyHint
 	OpenWorld       bool           // annotations.openWorldHint: the tool reaches beyond the server's own data
-	Run             func(ctx context.Context, args json.RawMessage) Result
+	// MaxArgBytes bounds this tool's arguments; 0 is 1 MiB. A tool that takes an image as an argument (base64)
+	// raises it; every other method and tool keeps the 1 MiB request cap.
+	MaxArgBytes int
+	Run         func(ctx context.Context, args json.RawMessage) Result
 }
 
 // Source is one citable link in a tool result's structuredContent. Image is a preview picture.
@@ -97,9 +101,8 @@ type File struct {
 }
 
 // Image is a picture a tool returns as MCP image content. Meta, when set, describes it in
-// structuredContent.images at the image's position (loom reads filename, model, provider, width, height,
-// duration_ms there). The server does not cap images: the client caps a reply (loom only lets one through from a
-// server it allows to make artifacts), so a tool keeps its images within that.
+// structuredContent.images at the image's position; its keys are the client's convention. Images over
+// Server.MaxImageBytes, or without a type or bytes, are left out and named in the text.
 type Image struct {
 	MimeType string
 	Data     []byte
@@ -151,21 +154,31 @@ func ObjectSchema(props map[string]any, required ...string) map[string]any {
 }
 
 type handler struct {
-	s       Server
-	origin  string
-	tools   map[string]Tool
-	ttlMs   int64
-	timeout time.Duration
-	maxText int
+	s         Server
+	origin    string
+	tools     map[string]Tool
+	ttlMs     int64
+	timeout   time.Duration
+	maxText   int
+	maxImages int
+	// maxBody is the largest body read at all: the default, or a tool's
+	// MaxArgBytes plus the envelope. Each method checks its own limit after.
 	maxBody int
 }
+
+// argEnvelopeBytes is room for the JSON-RPC envelope around a tool's arguments.
+const argEnvelopeBytes = 64 << 10
 
 // New returns the endpoint's handler: origin check, then Auth, then method, size and JSON-RPC handling.
 func New(s Server) http.Handler {
 	h := &handler{s: s, origin: originOf(s.AllowedOrigin), tools: map[string]Tool{},
-		ttlMs: s.ToolsTTL.Milliseconds(), timeout: s.ToolTimeout, maxText: s.MaxTextBytes, maxBody: s.MaxBodyBytes}
-	if h.maxBody <= 0 {
-		h.maxBody = defaultMaxBodyBytes
+		ttlMs: s.ToolsTTL.Milliseconds(), timeout: s.ToolTimeout, maxText: s.MaxTextBytes, maxImages: s.MaxImageBytes,
+		maxBody: defaultMaxBodyBytes}
+	if h.maxImages <= 0 {
+		h.maxImages = maxFilesBytes
+	}
+	for _, t := range s.Tools {
+		h.maxBody = max(h.maxBody, t.MaxArgBytes+argEnvelopeBytes)
 	}
 	if h.ttlMs <= 0 {
 		h.ttlMs = defaultToolsTTL.Milliseconds()
@@ -233,6 +246,11 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		writeRPCError(w, http.StatusBadRequest, req.ID, codeInvalidRequest, "invalid request", nil)
 		return
 	}
+	// Only a tool call may be larger, and only for a tool that asks for it (callTool checks which).
+	if req.Method != "tools/call" && len(body) > defaultMaxBodyBytes {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	h.dispatch(w, r, req)
 }
 
@@ -281,6 +299,10 @@ func (h *handler) callTool(w http.ResponseWriter, r *http.Request, req request, 
 		writeRPCError(w, http.StatusOK, req.ID, codeInvalidParams, "unknown tool: "+p.Name, nil)
 		return
 	}
+	if limit := cmp.Or(t.MaxArgBytes, defaultMaxBodyBytes); len(p.Arguments) > limit {
+		writeRPCError(w, http.StatusOK, req.ID, codeInvalidParams, "arguments too large for "+p.Name, nil)
+		return
+	}
 	if len(p.Arguments) == 0 || string(p.Arguments) == "null" {
 		p.Arguments = json.RawMessage("{}")
 	}
@@ -292,34 +314,30 @@ func (h *handler) callTool(w http.ResponseWriter, r *http.Request, req request, 
 	defer cancel()
 	start := time.Now()
 	res := t.Run(ctx, p.Arguments)
-	slog.Info("mcp tool call", "server", h.s.Name, "tool", p.Name, "is_error", res.IsError,
-		"ms", time.Since(start).Milliseconds())
-
 	files, dropped := fileContent(res.Files)
+	images, metas, droppedImages, imageBytes := h.imageContent(p.Name, res.Images)
+	slog.Info("mcp tool call", "server", h.s.Name, "tool", p.Name, "is_error", res.IsError,
+		"ms", time.Since(start).Milliseconds(), "images", len(images), "image_bytes", imageBytes)
+
+	for i := range dropped {
+		dropped[i] += " (too large)"
+	}
+	dropped = append(dropped, droppedImages...)
 	text := res.Text
 	if len(dropped) > 0 {
 		// Capped first, so the note survives a long text: without it the model would ask for a file it never got.
-		note := "\n(not attached, too large: " + strings.Join(dropped, ", ") + ")"
+		note := "\n(not attached: " + strings.Join(dropped, ", ") + ")"
 		text = CapText(text, h.maxText-len(note)) + note
 	} else {
 		text = CapText(text, h.maxText)
 	}
-	content := append([]map[string]any{{"type": "text", "text": text}}, files...)
+	// Order is part of the shape: text, files, then images (structuredContent.images[i] is the i-th image).
+	content := append(append([]map[string]any{{"type": "text", "text": text}}, files...), images...)
 	structured := map[string]any{}
 	if res.Sources != nil {
 		structured["sources"] = res.Sources
 	}
-	if len(res.Images) > 0 {
-		metas := make([]map[string]any, 0, len(res.Images))
-		for _, img := range res.Images {
-			content = append(content, map[string]any{"type": "image", "mimeType": img.MimeType,
-				"data": base64.StdEncoding.EncodeToString(img.Data)})
-			meta := img.Meta
-			if meta == nil {
-				meta = map[string]any{}
-			}
-			metas = append(metas, meta)
-		}
+	if len(metas) > 0 {
 		structured["images"] = metas
 	}
 	result := map[string]any{"content": content}
@@ -333,6 +351,36 @@ func (h *handler) callTool(w http.ResponseWriter, r *http.Request, req request, 
 		result = h.modern(result)
 	}
 	writeResult(w, req.ID, result)
+}
+
+// imageContent turns images into image blocks, in order, while they fit maxImages together, with their meta. Each
+// one left out (no type or bytes, over the budget) is named "image N" for the text. A meta that JSON cannot encode
+// (NaN, a func) goes out empty: the reply is written after its 200, so a failed encode would lose every image.
+func (h *handler) imageContent(tool string, imgs []Image) (blocks, metas []map[string]any, dropped []string, used int) {
+	for i, img := range imgs {
+		label := "image " + strconv.Itoa(i+1)
+		switch {
+		case img.MimeType == "" || len(img.Data) == 0:
+			dropped = append(dropped, label+" (empty)")
+			continue
+		case used+len(img.Data) > h.maxImages:
+			dropped = append(dropped, label+" (too large)")
+			continue
+		}
+		used += len(img.Data)
+		// []byte: encoding/json writes standard base64 itself, no extra copy as a string.
+		blocks = append(blocks, map[string]any{"type": "image", "mimeType": img.MimeType, "data": img.Data})
+		meta := img.Meta
+		if _, err := json.Marshal(meta); err != nil {
+			slog.Warn("mcp image meta not encodable, sent empty", "server", h.s.Name, "tool", tool, "image", i+1, "err", err)
+			meta = nil
+		}
+		if meta == nil {
+			meta = map[string]any{}
+		}
+		metas = append(metas, meta)
+	}
+	return blocks, metas, dropped, used
 }
 
 // fileContent turns files into embedded resources, in order, while they fit maxFilesBytes together; the names of

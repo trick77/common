@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -348,7 +349,7 @@ func TestHandler_filesAsResourcesWithinTheCap(t *testing.T) {
 	if len(content) != 3 {
 		t.Fatalf("want text + 2 resources (big.csv over the cap), got %d", len(content))
 	}
-	if text := toolText(t, r); !strings.Contains(text, "not attached, too large: big.csv") {
+	if text := toolText(t, r); !strings.Contains(text, "not attached: big.csv (too large)") {
 		t.Errorf("text does not name the dropped file: %q", text)
 	}
 	res := content[1].(map[string]any)
@@ -405,15 +406,73 @@ func TestHandler_noStructuredContentWithoutSourcesOrImages(t *testing.T) {
 	}
 }
 
-// MaxBodyBytes lets a tool take an image as an argument; the default stays 1 MiB.
-func TestHandler_maxBodyBytes(t *testing.T) {
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"` + strings.Repeat("x", 2<<20) + `"}}}`
-	if code, _, _ := call(t, testHandler(), body, nil); code != http.StatusRequestEntityTooLarge {
+// MaxArgBytes lets one tool take an image as an argument; every other tool and
+// method keeps 1 MiB.
+func TestHandler_maxArgBytes(t *testing.T) {
+	big := strings.Repeat("x", 2<<20)
+	callBody := func(tool string) string {
+		return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tool + `","arguments":{"text":"` + big + `"}}}`
+	}
+	if code, _, _ := call(t, testHandler(), callBody("echo"), nil); code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("default: status %d, want 413", code)
 	}
-	h := New(Server{Name: "t", Tools: []Tool{echoTool()}, MaxBodyBytes: 4 << 20})
-	if code, r, _ := call(t, h, body, nil); code != http.StatusOK || !strings.HasPrefix(toolText(t, r), "xxxx") {
-		t.Fatalf("raised: status %d", code)
+	wide := echoTool()
+	wide.Name, wide.MaxArgBytes = "wide", 4<<20
+	h := New(Server{Name: "t", Tools: []Tool{echoTool(), wide}})
+	if code, r, _ := call(t, h, callBody("wide"), nil); code != http.StatusOK || !strings.HasPrefix(toolText(t, r), "xxxx") {
+		t.Fatalf("raised tool: status %d", code)
+	}
+	if _, r, _ := call(t, h, callBody("echo"), nil); r.Error == nil || r.Error.Code != codeInvalidParams {
+		t.Fatalf("other tool on the same server took 2 MiB: %+v", r)
+	}
+	ping := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"p":"` + big + `"}}`
+	if code, _, _ := call(t, h, ping, nil); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("other method: status %d, want 413", code)
+	}
+}
+
+// Images keep within MaxImageBytes after text and files; one left out, empty or
+// over the budget, is named in the text, and its meta slot goes with it.
+func TestHandler_imagesWithinTheirBudget(t *testing.T) {
+	h := New(Server{Name: "t", MaxImageBytes: 10, Tools: []Tool{{
+		Name: "mixed",
+		Run: func(context.Context, json.RawMessage) Result {
+			return Result{Text: strings.Repeat("a line\n", 5000), Files: []File{{Name: "a.csv", MimeType: "text/csv", Text: "x"}}, Images: []Image{
+				{MimeType: "image/png", Data: []byte("12345678"), Meta: map[string]any{"n": 1}},
+				{MimeType: "image/png", Data: []byte("123456"), Meta: map[string]any{"n": 2}},
+				{MimeType: "", Data: []byte("1")},
+				{MimeType: "image/png", Data: []byte("12"), Meta: map[string]any{"n": 4}},
+			}}
+		},
+	}}})
+	_, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mixed"}}`, nil)
+	content, _ := r.Result["content"].([]any)
+	if len(content) != 4 || content[1].(map[string]any)["type"] != "resource" || content[2].(map[string]any)["type"] != "image" || content[3].(map[string]any)["type"] != "image" {
+		t.Fatalf("content = %+v", content)
+	}
+	text := toolText(t, r)
+	if !strings.HasSuffix(text, "(not attached: image 2 (too large), image 3 (empty))") || len(text) > defaultMaxTextBytes {
+		t.Errorf("text tail %q", text[len(text)-80:])
+	}
+	metas := r.Result["structuredContent"].(map[string]any)["images"].([]any)
+	if len(metas) != 2 || metas[0].(map[string]any)["n"] != float64(1) || metas[1].(map[string]any)["n"] != float64(4) {
+		t.Errorf("metas = %+v", metas)
+	}
+}
+
+// A meta JSON cannot encode goes out empty instead of losing the reply.
+func TestHandler_unencodableMetaSentEmpty(t *testing.T) {
+	h := New(Server{Name: "t", Tools: []Tool{{
+		Name: "nan",
+		Run: func(context.Context, json.RawMessage) Result {
+			return Result{Images: []Image{{MimeType: "image/png", Data: []byte("x"), Meta: map[string]any{"ms": math.NaN()}}}}
+		},
+	}}})
+	_, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nan"}}`, nil)
+	content, _ := r.Result["content"].([]any)
+	metas, _ := r.Result["structuredContent"].(map[string]any)["images"].([]any)
+	if len(content) != 2 || len(metas) != 1 || len(metas[0].(map[string]any)) != 0 {
+		t.Fatalf("reply = %+v", r.Result)
 	}
 }
 
@@ -427,7 +486,7 @@ func TestHandler_droppedNoteSurvivesALongText(t *testing.T) {
 	}}})
 	_, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"long"}}`, nil)
 	text := toolText(t, r)
-	if !strings.HasSuffix(text, "(not attached, too large: big.csv)") || len(text) > defaultMaxTextBytes {
+	if !strings.HasSuffix(text, "(not attached: big.csv (too large))") || len(text) > defaultMaxTextBytes {
 		t.Errorf("len %d, tail %q", len(text), text[len(text)-80:])
 	}
 }
