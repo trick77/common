@@ -357,6 +357,9 @@ func TestHandler_filesAsResourcesWithinTheCap(t *testing.T) {
 	if res["type"] != "resource" || inner["uri"] != "file:///a.csv" || inner["mimeType"] != "text/csv" || inner["text"] != "x,y\n1,2\n" {
 		t.Errorf("resource: %+v", res)
 	}
+	if _, ok := inner["blob"]; ok {
+		t.Errorf("a text file carries a blob: %+v", inner)
+	}
 	if !strings.Contains(raw, `"uri":"file:///b.json"`) {
 		t.Errorf("a small file after the dropped one is missing: %.200s", raw)
 	}
@@ -394,6 +397,100 @@ func TestHandler_imagesAsContentWithMeta(t *testing.T) {
 	}
 	if sources, ok := structured["sources"].([]any); !ok || len(sources) != 0 {
 		t.Errorf("sources = %+v, want the empty list kept", structured["sources"])
+	}
+}
+
+// A file with Data goes out as a blob resource, standard base64, no text.
+func TestHandler_binaryFileAsBlobResource(t *testing.T) {
+	data := []byte("%PDF-1.7\n\x00\xff\xfe binary")
+	h := New(Server{Name: "t", Tools: []Tool{{
+		Name: "doc",
+		Run: func(context.Context, json.RawMessage) Result {
+			return Result{Text: "made", Files: []File{{Name: "report.pdf", MimeType: "application/pdf", Text: "ignored", Data: data}}}
+		},
+	}}})
+	_, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"doc"}}`, nil)
+	content, _ := r.Result["content"].([]any)
+	if len(content) != 2 || toolText(t, r) != "made" {
+		t.Fatalf("content = %+v", content)
+	}
+	res := content[1].(map[string]any)
+	inner, _ := res["resource"].(map[string]any)
+	if res["type"] != "resource" || inner["uri"] != "file:///report.pdf" || inner["mimeType"] != "application/pdf" ||
+		inner["blob"] != base64.StdEncoding.EncodeToString(data) {
+		t.Errorf("blob resource = %+v", res)
+	}
+	if _, ok := inner["text"]; ok {
+		t.Errorf("a blob resource carries text: %+v", inner)
+	}
+}
+
+// Binary files keep within MaxBlobBytes, text files within their own 3 MiB: a
+// full text budget does not take room from blobs, and blobs none from text.
+func TestHandler_blobsWithinTheirOwnBudget(t *testing.T) {
+	h := New(Server{Name: "t", MaxBlobBytes: 10, Tools: []Tool{{
+		Name: "mixed",
+		Run: func(context.Context, json.RawMessage) Result {
+			return Result{Text: "here", Files: []File{
+				{Name: "a.bin", MimeType: "application/octet-stream", Data: []byte("12345678")},
+				{Name: "full.csv", MimeType: "text/csv", Text: strings.Repeat("x", maxFilesBytes)},
+				{Name: "b.bin", MimeType: "application/octet-stream", Data: []byte("123456")},
+				{Name: "c.bin", MimeType: "application/octet-stream", Data: []byte("12")},
+			}}
+		},
+	}}})
+	_, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mixed"}}`, nil)
+	content, _ := r.Result["content"].([]any)
+	if len(content) != 4 {
+		t.Fatalf("want text + a.bin + full.csv + c.bin, got %d blocks", len(content))
+	}
+	uris := []string{}
+	for _, c := range content[1:] {
+		uris = append(uris, c.(map[string]any)["resource"].(map[string]any)["uri"].(string))
+	}
+	if strings.Join(uris, " ") != "file:///a.bin file:///full.csv file:///c.bin" {
+		t.Errorf("resources = %v", uris)
+	}
+	if text := toolText(t, r); text != "here\n(not attached: b.bin (too large))" {
+		t.Errorf("text = %q", text)
+	}
+}
+
+// One result's content order: text, then files in Result.Files order (each a
+// text or a blob resource), then images.
+func TestHandler_contentOrder(t *testing.T) {
+	h := New(Server{Name: "t", Tools: []Tool{{
+		Name: "all",
+		Run: func(context.Context, json.RawMessage) Result {
+			return Result{Text: "all", Images: []Image{{MimeType: "image/png", Data: []byte("png")}}, Files: []File{
+				{Name: "a.pdf", MimeType: "application/pdf", Data: []byte("pdf")},
+				{Name: "b.csv", MimeType: "text/csv", Text: "x"},
+			}}
+		},
+	}}})
+	_, r, _ := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"all"}}`, nil)
+	content, _ := r.Result["content"].([]any)
+	if len(content) != 4 {
+		t.Fatalf("content = %+v", content)
+	}
+	got := []string{}
+	for _, c := range content {
+		m := c.(map[string]any)
+		kind, _ := m["type"].(string)
+		if inner, ok := m["resource"].(map[string]any); ok {
+			if _, blob := inner["blob"]; blob {
+				kind += ":blob"
+			} else {
+				kind += ":text"
+			}
+		}
+		got = append(got, kind)
+	}
+	if strings.Join(got, " ") != "text resource:blob resource:text image" {
+		t.Errorf("order = %v", got)
+	}
+	if metas, _ := r.Result["structuredContent"].(map[string]any)["images"].([]any); len(metas) != 1 {
+		t.Errorf("images meta = %+v", metas)
 	}
 }
 
