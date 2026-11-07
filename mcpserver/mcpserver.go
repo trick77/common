@@ -28,8 +28,10 @@ const (
 	defaultMaxTextBytes = 24 * 1024
 	// defaultToolsTTL is how long a client may cache tools/list and discovery: a static tool set, an hour.
 	defaultToolsTTL = time.Hour
-	// maxFilesBytes bounds one result's files together, so a reply stays under the 4 MiB a client caps it at
-	// (loom does) and the text always arrives.
+	// maxFilesBytes bounds one result's text files together, so a reply of text files stays under the 4 MiB a
+	// client caps it at (loom does) and the text always arrives. It is also the default budget for images and for
+	// binary files, each their own: a client taking several kinds in one reply sizes its cap to their sum, with
+	// images and binary files at 4/3 (base64).
 	maxFilesBytes = 3 << 20
 )
 
@@ -57,6 +59,9 @@ type Server struct {
 	// MaxImageBytes bounds one result's images together; 0 is 3 MiB, so a reply stays under a 4 MiB client cap.
 	// A server whose client takes larger replies (loom's artifact servers) raises it.
 	MaxImageBytes int
+	// MaxBlobBytes bounds one result's binary files (File.Data) together in raw bytes, sent as base64 at 4/3; 0 is
+	// 3 MiB. Text files and images keep their own budgets. A server whose client takes larger replies raises it.
+	MaxBlobBytes int
 	// AllowedOrigin is a base URL whose scheme://host[:port] is the one browser Origin accepted. Empty refuses
 	// every request that carries an Origin: server-to-server callers send none.
 	AllowedOrigin string
@@ -94,10 +99,13 @@ type Source struct {
 }
 
 // File is data a tool hands the client as an MCP embedded resource (loom gives it to run_python for the turn).
+// A non-empty Data makes it a binary file: the resource carries blob (standard base64 of Data), Text is ignored,
+// and one without a MimeType is left out and named in the text. Otherwise it is a text resource carrying Text.
 type File struct {
 	Name     string // a plain file name, e.g. strava_123_streams.csv
-	MimeType string // text/csv or application/json
+	MimeType string // text/csv, application/json, application/pdf, ...
 	Text     string
+	Data     []byte
 }
 
 // Image is a picture a tool returns as MCP image content. Meta, when set, describes it in
@@ -110,8 +118,8 @@ type Image struct {
 }
 
 // Result is what a tool produced. Sources[i] belongs to the text's item i+1; nil Sources sends no
-// structuredContent.sources, a non-nil empty slice an empty list. Images follow the text and files as image
-// blocks.
+// structuredContent.sources, a non-nil empty slice an empty list. Files follow the text as embedded resources,
+// images follow the files as image blocks.
 type Result struct {
 	Text    string
 	Sources []Source
@@ -161,6 +169,7 @@ type handler struct {
 	timeout   time.Duration
 	maxText   int
 	maxImages int
+	maxBlobs  int
 	// maxBody is the largest body read at all: the default, or a tool's
 	// MaxArgBytes plus the envelope. Each method checks its own limit after.
 	maxBody int
@@ -173,9 +182,12 @@ const argEnvelopeBytes = 64 << 10
 func New(s Server) http.Handler {
 	h := &handler{s: s, origin: originOf(s.AllowedOrigin), tools: map[string]Tool{},
 		ttlMs: s.ToolsTTL.Milliseconds(), timeout: s.ToolTimeout, maxText: s.MaxTextBytes, maxImages: s.MaxImageBytes,
-		maxBody: defaultMaxBodyBytes}
+		maxBlobs: s.MaxBlobBytes, maxBody: defaultMaxBodyBytes}
 	if h.maxImages <= 0 {
 		h.maxImages = maxFilesBytes
+	}
+	if h.maxBlobs <= 0 {
+		h.maxBlobs = maxFilesBytes
 	}
 	for _, t := range s.Tools {
 		h.maxBody = max(h.maxBody, t.MaxArgBytes+argEnvelopeBytes)
@@ -314,15 +326,13 @@ func (h *handler) callTool(w http.ResponseWriter, r *http.Request, req request, 
 	defer cancel()
 	start := time.Now()
 	res := t.Run(ctx, p.Arguments)
-	files, dropped := fileContent(res.Files)
+	files, dropped, blobBytes := h.fileContent(res.Files)
 	images, metas, droppedImages, imageBytes := h.imageContent(p.Name, res.Images)
-	slog.Info("mcp tool call", "server", h.s.Name, "tool", p.Name, "is_error", res.IsError,
-		"ms", time.Since(start).Milliseconds(), "images", len(images), "image_bytes", imageBytes)
-
-	for i := range dropped {
-		dropped[i] += " (too large)"
-	}
 	dropped = append(dropped, droppedImages...)
+	slog.Info("mcp tool call", "server", h.s.Name, "tool", p.Name, "is_error", res.IsError,
+		"ms", time.Since(start).Milliseconds(), "files", len(files), "blob_bytes", blobBytes,
+		"images", len(images), "image_bytes", imageBytes, "not_attached", len(dropped))
+
 	text := res.Text
 	if len(dropped) > 0 {
 		// Capped first, so the note survives a long text: without it the model would ask for a file it never got.
@@ -331,7 +341,8 @@ func (h *handler) callTool(w http.ResponseWriter, r *http.Request, req request, 
 	} else {
 		text = CapText(text, h.maxText)
 	}
-	// Order is part of the shape: text, files, then images (structuredContent.images[i] is the i-th image).
+	// Order is part of the shape: text, then files in Result.Files order (each a text or a blob resource), then
+	// images (structuredContent.images[i] is the i-th image).
 	content := append(append([]map[string]any{{"type": "text", "text": text}}, files...), images...)
 	structured := map[string]any{}
 	if res.Sources != nil {
@@ -383,21 +394,29 @@ func (h *handler) imageContent(tool string, imgs []Image) (blocks, metas []map[s
 	return blocks, metas, dropped, used
 }
 
-// fileContent turns files into embedded resources, in order, while they fit maxFilesBytes together; the names of
-// those that do not are returned so the text can say so.
-func fileContent(files []File) ([]map[string]any, []string) {
-	var out []map[string]any
-	var dropped []string
-	used := 0
+// fileContent turns files into embedded resources, in order: text files while they fit maxFilesBytes together,
+// binary files while they fit maxBlobs together, each budget its own. Each one left out (over its budget, a binary
+// file without a type) is named for the text. The uri is the plain name unescaped, as text files always had it.
+func (h *handler) fileContent(files []File) (out []map[string]any, dropped []string, blobBytes int) {
+	textBytes := 0
 	for _, f := range files {
-		if used+len(f.Text) > maxFilesBytes {
-			dropped = append(dropped, f.Name)
+		// []byte: encoding/json writes standard base64 itself, the MCP blob encoding.
+		used, limit, key, val, size := &textBytes, maxFilesBytes, "text", any(f.Text), len(f.Text)
+		if len(f.Data) > 0 {
+			used, limit, key, val, size = &blobBytes, h.maxBlobs, "blob", f.Data, len(f.Data)
+			if f.MimeType == "" {
+				dropped = append(dropped, f.Name+" (no type)")
+				continue
+			}
+		}
+		if *used+size > limit {
+			dropped = append(dropped, f.Name+" (too large)")
 			continue
 		}
-		used += len(f.Text)
+		*used += size
 		out = append(out, map[string]any{"type": "resource", "resource": map[string]any{
-			"uri": "file:///" + f.Name, "mimeType": f.MimeType, "text": f.Text,
+			"uri": "file:///" + f.Name, "mimeType": f.MimeType, key: val,
 		}})
 	}
-	return out, dropped
+	return out, dropped, blobBytes
 }
