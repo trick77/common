@@ -1,6 +1,8 @@
 version: 2
 updates:
   - package-ecosystem: gomod
+    cooldown:
+      default-days: 7
     directory: /
     commit-message: { prefix: deps }   # Go style: "deps: bump …"
     schedule:
@@ -32,6 +34,8 @@ updates:
           - major
 
   - package-ecosystem: github-actions
+    cooldown:
+      default-days: 7
     directory: /
     commit-message: { prefix: deps }   # Go style: "deps: bump …"
     schedule:
