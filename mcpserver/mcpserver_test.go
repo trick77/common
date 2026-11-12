@@ -640,7 +640,7 @@ func TestOneLine(t *testing.T) {
 }
 
 func TestSourceProductInStructuredContent(t *testing.T) {
-	price := 29.9
+	price, was := 29.9, 35.0
 	h := New(Server{Name: "t", Version: "v1", Tools: []Tool{{
 		Name: "shop", ReadOnly: true,
 		Run: func(context.Context, json.RawMessage) Result {
@@ -648,6 +648,8 @@ func TestSourceProductInStructuredContent(t *testing.T) {
 				{URL: "https://shop.example/a", Title: "A", Product: &Product{Price: &price, Currency: "CHF", Rating: 4.7, RatingCount: 853}},
 				{URL: "https://shop.example/b", Title: "B", Product: &Product{Rating: 4}},
 				{URL: "https://shop.example/c", Title: "C"},
+				{URL: "https://shop.example/d", Title: "D", Product: &Product{Price: &price, Currency: "CHF", WasPrice: &was,
+					Availability: AvailabilityOnOrder, Condition: ConditionUsed}},
 			}}
 		},
 	}}})
@@ -657,6 +659,7 @@ func TestSourceProductInStructuredContent(t *testing.T) {
 		// No price known: the field is left out, never sent as 0.
 		`{"url":"https://shop.example/b","title":"B","product":{"rating":4}}`,
 		`{"url":"https://shop.example/c","title":"C"}`,
+		`"product":{"price":29.9,"currency":"CHF","wasPrice":35,"availability":"on_order","condition":"used"}`,
 	} {
 		if !strings.Contains(raw, want) {
 			t.Errorf("structuredContent lacks %s: %s", want, raw)
