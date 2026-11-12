@@ -283,6 +283,32 @@ func TestChat_HeaderStallIsNamed(t *testing.T) {
 	}
 }
 
+// The header guard and the call cap expire together on a non-streaming call;
+// whichever wins, a call that never got headers is named a header stall. This
+// is the losing half of that race, set up directly (it flaked CI one run in
+// many).
+func TestExplain_CapBeforeGuardStillNamesTheHeaderStall(t *testing.T) {
+	c := New(Config{BaseURL: "http://unused", Registry: Default(), CallTimeout: 60 * time.Millisecond})
+	call, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	waiting := newStallGuard(func() {}, time.Hour, stallHeaders)
+	defer waiting.stop()
+	err := c.explain(context.Background(), call, waiting, context.DeadlineExceeded)
+	if !errors.Is(err, ErrNoResponseHeaders) || !errors.Is(err, ErrCallCap) || !strings.Contains(err.Error(), "60ms") {
+		t.Errorf("awaiting headers: %v, want both a header stall and the 60ms call cap", err)
+	}
+
+	// Headers came (the guard re-armed for the body): only the cap.
+	reading := newStallGuard(func() {}, time.Hour, stallHeaders)
+	defer reading.stop()
+	reading.arm(time.Hour, stallIdle)
+	err = c.explain(context.Background(), call, reading, context.DeadlineExceeded)
+	if errors.Is(err, ErrNoResponseHeaders) || !errors.Is(err, ErrCallCap) {
+		t.Errorf("reading the body: %v, want the call cap alone", err)
+	}
+}
+
 // A non-streaming answer slower than the HEADER bound but inside the call cap must
 // still succeed. mimo-v2.5-pro (retired) measured 25-64 seconds per call against a 60s
 // default header timeout, so binding this route to c.header would abort calls the

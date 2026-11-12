@@ -633,3 +633,11 @@ func (g *stallGuard) firedReason() (string, time.Duration) {
 	defer g.mu.Unlock()
 	return g.reason, g.firedFor
 }
+
+// awaitingHeaders reports whether the guard was still waiting for headers:
+// armed for them and neither fired nor re-armed for idleness.
+func (g *stallGuard) awaitingHeaders() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.fired && g.pending == stallHeaders
+}
