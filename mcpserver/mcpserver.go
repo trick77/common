@@ -101,13 +101,32 @@ type Source struct {
 }
 
 // Product is what a shop knows about a product page. A nil Price is no price known (out of the range, on
-// request), never zero; Currency is ISO 4217. Rating is the average of RatingCount ratings, 0 none.
+// request), never zero; Currency is ISO 4217. WasPrice is the price before a discount, in Currency, nil when
+// not reduced. Rating is the average of RatingCount ratings, 0 none. Availability (Availability*) is how soon
+// it ships and Condition (Condition*) how it comes; "" is not known, or new.
 type Product struct {
-	Price       *float64 `json:"price,omitempty"`
-	Currency    string   `json:"currency,omitempty"`
-	Rating      float64  `json:"rating,omitempty"`
-	RatingCount int      `json:"ratingCount,omitempty"`
+	Price        *float64 `json:"price,omitempty"`
+	Currency     string   `json:"currency,omitempty"`
+	WasPrice     *float64 `json:"wasPrice,omitempty"`
+	Rating       float64  `json:"rating,omitempty"`
+	RatingCount  int      `json:"ratingCount,omitempty"`
+	Availability string   `json:"availability,omitempty"`
+	Condition    string   `json:"condition,omitempty"`
 }
+
+// Product.Availability, soonest first.
+const (
+	AvailabilityInStock   = "in_stock"       // in the shop's own stock: a day or two
+	AvailabilitySupplier  = "supplier_stock" // in stock at a supplier or third party: a few days
+	AvailabilityOnOrder   = "on_order"       // not in stock, ordered from the supplier: one to three weeks
+	AvailabilityUncertain = "uncertain"      // not in stock, no firm date: weeks, or not available now
+)
+
+// Product.Condition, for anything not new.
+const (
+	ConditionUsed    = "used"
+	ConditionDisplay = "display" // a showroom or demo unit
+)
 
 // File is data a tool hands the client as an MCP embedded resource (loom gives it to run_python for the turn).
 // A non-empty Data makes it a binary file: the resource carries blob (standard base64 of Data), Text is ignored,
