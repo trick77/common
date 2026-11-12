@@ -638,3 +638,28 @@ func TestOneLine(t *testing.T) {
 		}
 	}
 }
+
+func TestSourceProductInStructuredContent(t *testing.T) {
+	price := 29.9
+	h := New(Server{Name: "t", Version: "v1", Tools: []Tool{{
+		Name: "shop", ReadOnly: true,
+		Run: func(context.Context, json.RawMessage) Result {
+			return Result{Text: "two", Sources: []Source{
+				{URL: "https://shop.example/a", Title: "A", Product: &Product{Price: &price, Currency: "CHF", Rating: 4.7, RatingCount: 853}},
+				{URL: "https://shop.example/b", Title: "B", Product: &Product{Rating: 4}},
+				{URL: "https://shop.example/c", Title: "C"},
+			}}
+		},
+	}}})
+	_, _, raw := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shop","arguments":{}}}`, nil)
+	for _, want := range []string{
+		`{"url":"https://shop.example/a","title":"A","product":{"price":29.9,"currency":"CHF","rating":4.7,"ratingCount":853}}`,
+		// No price known: the field is left out, never sent as 0.
+		`{"url":"https://shop.example/b","title":"B","product":{"rating":4}}`,
+		`{"url":"https://shop.example/c","title":"C"}`,
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("structuredContent lacks %s: %s", want, raw)
+		}
+	}
+}
