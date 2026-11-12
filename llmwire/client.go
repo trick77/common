@@ -798,9 +798,18 @@ func (c *Client) explain(parent, call context.Context, guard *stallGuard, err er
 		return fmt.Errorf("llmwire: %w for %s", ErrStreamIdle, bound)
 	}
 	if call.Err() != nil && parent.Err() == nil {
+		capErr := &callCapError{cap: c.cap}
+		// A non-streaming call arms the header guard with the cap itself, so
+		// the two expire together and either may win. When the cap wins
+		// before any header came, the endpoint still sent nothing: say so,
+		// or the same stall reads two ways depending on a timer race (a CI
+		// flake). Both sentinels hold.
+		if guard.awaitingHeaders() {
+			return fmt.Errorf("llmwire: %w within %s: %w", ErrNoResponseHeaders, c.cap, capErr)
+		}
 		// Phrased around the sentinel so the message still reads "exceeded
 		// the 15m0s call cap" and errors.Is(err, ErrCallCap) holds.
-		return fmt.Errorf("llmwire: %w", &callCapError{cap: c.cap})
+		return fmt.Errorf("llmwire: %w", capErr)
 	}
 	return c.scrub(err)
 }
