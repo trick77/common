@@ -89,13 +89,24 @@ type Tool struct {
 	Run         func(ctx context.Context, args json.RawMessage) Result
 }
 
-// Source is one citable link in a tool result's structuredContent. Image is a preview picture.
+// Source is one citable link in a tool result's structuredContent. Image is a preview picture; Product marks
+// the link as a product page a client may show as a card.
 type Source struct {
-	URL     string `json:"url"`
-	Title   string `json:"title"`
-	Label   string `json:"label,omitempty"`
-	Snippet string `json:"snippet,omitempty"`
-	Image   string `json:"image,omitempty"`
+	URL     string   `json:"url"`
+	Title   string   `json:"title"`
+	Label   string   `json:"label,omitempty"`
+	Snippet string   `json:"snippet,omitempty"`
+	Image   string   `json:"image,omitempty"`
+	Product *Product `json:"product,omitempty"`
+}
+
+// Product is what a shop knows about a product page. A nil Price is no price known (out of the range, on
+// request), never zero; Currency is ISO 4217. Rating is the average of RatingCount ratings, 0 none.
+type Product struct {
+	Price       *float64 `json:"price,omitempty"`
+	Currency    string   `json:"currency,omitempty"`
+	Rating      float64  `json:"rating,omitempty"`
+	RatingCount int      `json:"ratingCount,omitempty"`
 }
 
 // File is data a tool hands the client as an MCP embedded resource (loom gives it to run_python for the turn).
