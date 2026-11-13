@@ -378,14 +378,14 @@ Anthropic's Messages protocol (`wire_api: messages`).
 
 | bit | value | probe |
 |---|---|---|
-| `reasoning.effort_values` | **low, medium, high, xhigh, max**; `none` and `minimal` a 400 | `OpusEffortLadder` |
-| `reasoning.can_be_disabled` | **false**: `thinking.type` `disabled` and `enabled` (budget) a 400 | `OpusRefusals` |
-| `temperature` / `top_p` | **unsupported**: "Extra inputs are not permitted", 400 | `OpusRefusals` |
-| `tool_choice_values` | **auto, none**: `any` and `tool` a 400 | `OpusRefusals` |
-| `json_schema` | **true**, the reply parsed | `OpusStructuredOutput` |
-| usage containment | **cache BESIDE input_tokens** | `OpusCacheContainment` |
-| `limits` | **1,000,000 / 128,000**, from the models listing | `OpusModelsListing` |
-| uncapped call | **accepted** at `max_tokens` 128000, non-streamed | `OpusBasics` |
+| `reasoning.effort_values` | **low, medium, high, xhigh, max**; `none` and `minimal` a 400 | `MessagesEffortLadder` |
+| `reasoning.can_be_disabled` | **false**: `thinking.type` `disabled` and `enabled` (budget) a 400 | `MessagesRefusals` |
+| `temperature` / `top_p` | **unsupported**: "Extra inputs are not permitted", 400 | `MessagesRefusals` |
+| `tool_choice_values` | **auto, none**: `any` and `tool` a 400 | `MessagesRefusals` |
+| `json_schema` | **true**, the reply parsed | `MessagesStructuredOutput` |
+| usage containment | **cache BESIDE input_tokens** | `MessagesCacheContainment` |
+| `limits` | **1,000,000 / 128,000**, from the models listing | `MessagesModelsListing` |
+| uncapped call | **accepted** at `max_tokens` 128000, non-streamed | `MessagesBasics` |
 
 Every refusal is `400 invalid_request_error`; the error body is
 `{"type":"error","error":{"type":…,"message":…}}`, and `error.type` becomes
@@ -411,16 +411,16 @@ counting problem streamed 1144 `thinking_delta` frames over 2m40s and stopped
 at `max_tokens` 16000 with all 16000 output tokens thinking and no answer. The
 longest gap between non-ping frames was 4.8s, and only ONE `ping` arrived in
 the whole stream, so the idle guard is fed by the thinking summary, never by
-heartbeats (`OpusStreamFrames`). `DefaultReasoningOverhead` is far short at
+heartbeats (`MessagesStreamFrames`). `DefaultReasoningOverhead` is far short at
 `high` and above: `MaxAnswerTokens` with a small answer can return `length` and
 no content until an overhead is measured.
 
 **Thinking replay.** Round 1 of the tool loop returned a signed `thinking`
 block and a `tool_use`; round 2 with `resp.Assistant()` answered. A
 hand-built assistant turn carrying only the `tool_use`, no thinking block, was
-ACCEPTED too, as was the replay of a streamed turn (`OpusToolLoop`).
+ACCEPTED too, as was the replay of a streamed turn (`MessagesToolLoop`).
 
-**Conversation shapes** (`OpusConversationShapes`): ending on an assistant
+**Conversation shapes** (`MessagesConversationShapes`): ending on an assistant
 turn is a 400, "This model does not support assistant message prefill. The
 conversation must end with a user message." (`assistant_prefill: false`).
 Opening on one, and two assistant turns in a row, were accepted. A
@@ -434,7 +434,7 @@ defined, so tool turns are sent as they are. User text ahead of the
 `tool_result` blocks immediately after"; plan refuses user content between a
 call and its results by index. An assistant turn there was accepted: the
 endpoint joins consecutive assistant turns. With real signed thinking
-(`OpusSignedJoins`, same effort as the replayed turns): a plain note after a
+(`MessagesSignedJoins`, same effort as the replayed turns): a plain note after a
 replayed calling turn was accepted; a replayed turn sent twice was a 400,
 "Invalid `signature` in `thinking` block. The block is bound to a different
 conversation." Plan does not refuse it: it cannot tell an edited history from
@@ -442,6 +442,47 @@ a genuine one (another model's replies, a turn with no signed block), so the
 endpoint's 400 comes back as that APIError.
 
 Not measured: vision, parallel tool calls, a stop sequence.
+
+### `claude-fable-5-2`
+
+Measured on 2026-11-13 against `api.anthropic.com/v1`, `anthropic-version:
+2026-10-21`, through `FromEnv`: the `Messages*` probes' `claude-fable-5-2`
+subtests. 43 calls, about $0.76.
+
+| bit | value | probe |
+|---|---|---|
+| `reasoning.effort_values` | **low, medium, high, xhigh, max**; `none` and `minimal` a 400 | `MessagesEffortLadder` |
+| `reasoning.can_be_disabled` | **false**: `thinking.type` `disabled` and `enabled` a 400 | `MessagesRefusals` |
+| `temperature` / `top_p` | **unsupported**: "Extra inputs are not permitted", 400 | `MessagesRefusals` |
+| `tool_choice_values` | **auto, none**: `any` and `tool` a 400 | `MessagesRefusals` |
+| `json_schema` | **true**, the reply parsed | `MessagesStructuredOutput` |
+| usage containment | **cache BESIDE input_tokens** | `MessagesCacheContainment` |
+| `limits` | **1,000,000 / 128,000**, from the models listing | `MessagesModelsListing` |
+| `assistant_prefill` | **false**, the same 400 as Opus | `MessagesConversationShapes` |
+
+The refusals and conversation shapes answer exactly as on Opus 5.5, verbatim.
+
+**The history-editing check is enforced** (`MessagesEditedHistory`). Round 1
+of a tool loop, then round 2 with the system prompt changed: replaying
+`resp.Assistant()` is a 400, "messages.1.content.0: Invalid `signature` in
+`thinking` block. The block is bound to a different conversation. Remove the
+block, or set `thinking.block_binding.prefix_mismatch_behavior` to
+\"drop_block\"." The same round with the assistant turn rebuilt, the
+`tool_use` only, was accepted. A caller that rewrites history sends no
+ResponseItems; one that only appends replays them.
+
+**A signed turn sent twice was ACCEPTED** (`MessagesSignedJoins`), where Opus
+5.5 returned the signature 400. Plan does not refuse either way.
+
+**Thinking at `high`** (`MessagesDeepOverhead`, two runs): three chat prompts
+thought 37-124 tokens and answered in 2-4s. The `MessagesStreamFrames`
+counting problem spent its whole 4000 cap thinking in 40s, longest gap 4.8s,
+one ping; the same prompt with a 64000 cap, an ad-hoc run not kept as a
+probe, was still thinking when a 5-minute call cap fired. No `overhead`
+recorded: the spread has no single figure.
+
+Not measured: vision, parallel tool calls, refusal `stop_details`, a deep pass
+to completion.
 
 ## Where the documentation is wrong
 

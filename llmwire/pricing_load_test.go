@@ -412,6 +412,10 @@ func TestDefault_ShippedRatesMatchTheVendorPages(t *testing.T) {
 		// cache_write is 0 against the page's 2.50 until a probe reads the
 		// containment of cache_write_tokens (profiles.yaml cost comment).
 		{id: "gpt-6.1-sol", input: 2_000_000_000, cacheRead: 100_000_000, cacheWrite: 0, out: 10_000_000_000, hasOutput: true},
+		// Pricing page 2026-10-26 (Opus) and the skill reference 2026-11-03
+		// (Fable); cache_write is the 5-minute lane.
+		{id: "claude-opus-5-5", input: 4_000_000_000, cacheRead: 200_000_000, cacheWrite: 5_000_000_000, out: 20_000_000_000, hasOutput: true},
+		{id: "claude-fable-5-2", input: 8_000_000_000, cacheRead: 200_000_000, cacheWrite: 10_000_000_000, out: 40_000_000_000, hasOutput: true},
 		{id: "text-embedding-3-small", input: 20_000_000},
 		{id: "text-embedding-3-large", input: 130_000_000},
 	} {

@@ -40,6 +40,15 @@ func resolveReasoning(want ReasoningRequest, r Reasoning) ReasoningRequest {
 			return nil
 		}
 		return reasoningEffort{level: r.Balanced}
+	case reasoningDeep:
+		level := r.Deep
+		if level == "" {
+			level = r.Balanced
+		}
+		if !r.Supported || level == "" {
+			return nil
+		}
+		return reasoningEffort{level: level}
 	default:
 		return want
 	}

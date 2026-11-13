@@ -20,6 +20,7 @@ profiles:
       control: effort
       effort_values: [none, low, medium, high]
       balanced: medium
+      deep: high
       overhead: {low: 128, medium: 256, high: 512}
     temperature: {supported: true}
     top_p: {supported: true}
@@ -68,6 +69,7 @@ profiles:
       control: effort
       effort_values: [none, low, medium, high]
       balanced: medium
+      deep: high
       overhead: {low: 128, medium: 256, high: 512}
     temperature: {supported: true}
     top_p: {supported: true}
@@ -102,6 +104,7 @@ profiles:
       control: effort
       effort_values: [low, medium, high]
       balanced: medium
+      deep: high
       overhead: {low: 128, medium: 256, high: 512}
     tools:
       supported: true

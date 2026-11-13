@@ -13,7 +13,7 @@ downgrade. Fully resolved at load: no call-site defaults.
   `ReasoningMinimal` reads `effort_values` entry 0 as the floor.
 - `overhead` absent unless measured; `DefaultReasoningOverhead` (1024) is known
   short at glm max.
-- Clients express **intents** (`ReasoningMinimal/Balanced`, `MaxAnswerTokens`,
+- Clients express **intents** (`ReasoningMinimal/Balanced/Deep`, `MaxAnswerTokens`,
   `Needs`), never a model's level names or caps. A model fact a client needs
   goes in the profile, not in the client.
 - Gateway entries validate against `base` even where the gateway would drop the
@@ -25,7 +25,9 @@ downgrade. Fully resolved at load: no call-site defaults.
 - A demoted (`BestEffort`) refusal must DROP the knob on the coerced request.
 - `Validate` is exported and read-only → the coerced copy is deep.
 - Tool loops append `resp.Assistant()`, never a rebuilt turn (encrypted
-  reasoning on Responses, signed thinking on Messages). Read the head comment of
+  reasoning on Responses, signed thinking on Messages). A caller that edits
+  the history (system, tools, an earlier turn) sends it without ResponseItems:
+  claude-fable-5-2 refuses a signed block replayed after an edit. Read the head comment of
   `responses.go`, `messages.go`, `stream.go` before touching them.
 
 ## Transport

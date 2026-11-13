@@ -61,13 +61,15 @@ const (
 	// EmbedModel returns EmbedDimensions-long vectors.
 	EmbedModel = "llmwiretest-embed"
 
-	// MinimalSent and BalancedSent are ChatModel's ReasoningSent for
-	// ReasoningMinimal and ReasoningBalanced; the Overhead constants are what
-	// MaxAnswerTokens adds for each.
+	// MinimalSent, BalancedSent and DeepSent are ChatModel's ReasoningSent
+	// for ReasoningMinimal, ReasoningBalanced and ReasoningDeep; the Overhead
+	// constants are what MaxAnswerTokens adds for each.
 	MinimalSent      = "off"
 	MinimalOverhead  = 0
 	BalancedSent     = "medium"
 	BalancedOverhead = 256
+	DeepSent         = "high"
+	DeepOverhead     = 512
 
 	// EmbedDimensions is EmbedModel's default vector length.
 	EmbedDimensions = 8

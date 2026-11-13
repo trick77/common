@@ -162,7 +162,7 @@ func TestDefault_MeasuredFactsMatchFindings(t *testing.T) {
 		}
 	})
 
-	t.Run("claude-opus-5-5 as OpusRefusals and OpusEffortLadder read it", func(t *testing.T) {
+	t.Run("claude-opus-5-5 as MessagesRefusals and MessagesEffortLadder read it", func(t *testing.T) {
 		p := mustLookup(t, reg, "claude-opus-5-5")
 		if p.Reasoning.CanBeDisabled || !p.Reasoning.EnabledByDefault {
 			t.Error("thinking.type disabled is a 400; the model always thinks")
@@ -178,6 +178,34 @@ func TestDefault_MeasuredFactsMatchFindings(t *testing.T) {
 		}
 		if p.APIKeyHeader != "x-api-key" || p.Headers["anthropic-version"] == "" {
 			t.Errorf("provider: key header %q, headers %v", p.APIKeyHeader, p.Headers)
+		}
+	})
+
+	t.Run("claude-fable-5-2 as the Messages probes read it", func(t *testing.T) {
+		p := mustLookup(t, reg, "claude-fable-5-2")
+		if p.Verified != VerifiedMeasured {
+			t.Errorf("verified = %q; the Messages probes ran against it", p.Verified)
+		}
+		if p.Reasoning.CanBeDisabled || !p.Reasoning.EnabledByDefault {
+			t.Error("MessagesRefusals: thinking.type disabled is a 400; the model always thinks")
+		}
+		if got := strings.Join(p.Reasoning.EffortValues, ","); got != "low,medium,high,xhigh,max" {
+			t.Errorf("MessagesEffortLadder: effort_values = %s; none and minimal were refused", got)
+		}
+		if p.Temperature.Supported || p.TopP.Supported {
+			t.Error("MessagesRefusals: temperature and top_p are a 400")
+		}
+		if p.Tools.SupportsForcedChoice || slices.Contains(p.Tools.ToolChoiceValues, "required") {
+			t.Error("MessagesRefusals: tool_choice any and tool are a 400")
+		}
+		if !p.Output.JSONSchema {
+			t.Error("MessagesStructuredOutput: json_schema parsed")
+		}
+		if p.Limits.Context != 1_000_000 || p.Limits.MaxOutput != 128_000 {
+			t.Errorf("MessagesModelsListing: limits %d / %d, want 1000000 / 128000", p.Limits.Context, p.Limits.MaxOutput)
+		}
+		if p.AssistantPrefill {
+			t.Error("MessagesConversationShapes: a prefill is a 400")
 		}
 	})
 }

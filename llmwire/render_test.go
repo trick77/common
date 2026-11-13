@@ -48,6 +48,7 @@ func TestRender_OutputCapUsesTheProfilesSpelling(t *testing.T) {
 		// decides which one goes on the wire.
 		{"mimo-v2.6-pro", "max_completion_tokens", "max_tokens"},
 		{"mimo-v2.6-flash", "max_completion_tokens", "max_tokens"},
+		{"claude-fable-5-2", "max_tokens", "max_completion_tokens"},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			body := renderFor(t, c, ChatRequest{
