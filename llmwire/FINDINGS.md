@@ -477,8 +477,9 @@ ResponseItems; one that only appends replays them.
 **Thinking at `high`** (`MessagesDeepOverhead`, two runs): three chat prompts
 thought 37-124 tokens and answered in 2-4s. The `MessagesStreamFrames`
 counting problem spent its whole 4000 cap thinking in 40s, longest gap 4.8s,
-one ping; the same prompt with a 64000 cap was still thinking when a 5-minute
-call cap fired. No `overhead` recorded: the spread has no single figure.
+one ping; the same prompt with a 64000 cap, an ad-hoc run not kept as a
+probe, was still thinking when a 5-minute call cap fired. No `overhead`
+recorded: the spread has no single figure.
 
 Not measured: vision, parallel tool calls, refusal `stop_details`, a deep pass
 to completion.

@@ -799,6 +799,9 @@ func (p Profile) validateChat(bad func(string, ...any) error) error {
 		if r.Deep != "" && (r.Deep == "none" || !r.Accepts(r.Deep)) {
 			return bad("deep %q must be one of effort_values %v other than none", r.Deep, r.EffortValues)
 		}
+		if r.Deep != "" && r.Balanced != "" && slices.Index(effortLadder, r.Deep) < slices.Index(effortLadder, r.Balanced) {
+			return bad("deep %q is shallower than balanced %q; deep means more thinking", r.Deep, r.Balanced)
+		}
 		if err := r.checkOverhead(bad); err != nil {
 			return err
 		}

@@ -1294,6 +1294,7 @@ profiles:
       while the same turn rebuilt without its thinking block is accepted. So
       a tool loop appends resp.Assistant() and only appends; a caller that
       rewrites the history sends the rebuilt turns, no ResponseItems. It
-      reads earlier models' thinking; no earlier model reads its. A refusal
-      is content_filter. No forced tool choice, no temperature or top_p, no
-      json_object.
+      reads earlier models' thinking and no earlier model reads its, and a
+      refusal maps to content_filter: both NOT measured, skill reference, as
+      is the retention 400. No forced tool choice, no temperature or top_p,
+      no json_object.

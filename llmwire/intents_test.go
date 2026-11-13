@@ -234,9 +234,10 @@ func TestReasoningDeep_Resolution(t *testing.T) {
 // none, is refused; so is deep on a model that does not reason.
 func TestReasoningDeep_ProfileValidation(t *testing.T) {
 	for name, reasoning := range map[string]string{
-		"unknown level": "{supported: true, enabled_by_default: true, control: effort, effort_values: [low, high], deep: max}",
-		"none":          "{supported: true, enabled_by_default: true, can_be_disabled: true, control: effort, effort_values: [none, low, high], deep: none}",
-		"unsupported":   "{supported: false, deep: high}",
+		"unknown level":  "{supported: true, enabled_by_default: true, control: effort, effort_values: [low, high], deep: max}",
+		"none":           "{supported: true, enabled_by_default: true, can_be_disabled: true, control: effort, effort_values: [none, low, high], deep: none}",
+		"unsupported":    "{supported: false, deep: high}",
+		"below balanced": "{supported: true, enabled_by_default: true, control: effort, effort_values: [low, medium, high], balanced: high, deep: low}",
 	} {
 		_, err := NewRegistry([]byte(chatHead + "    reasoning: " + reasoning + "\n"))
 		if err == nil || !strings.Contains(err.Error(), "deep") {

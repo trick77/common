@@ -279,7 +279,9 @@ func TestProbe_MessagesToolLoop(t *testing.T) {
 			res.MaxDataGap, res.Timing.Total, res.Usage.Raw, res.Usage.Cost)
 		var args map[string]any
 		if len(res.ToolCalls) != 1 || json.Unmarshal([]byte(res.ToolCalls[0].Arguments), &args) != nil {
-			t.Errorf("FINDING stream: tool call %+v does not carry one JSON argument object", res.ToolCalls)
+			// Fatal: the replay below indexes the call, and a panic would
+			// stop every later model's subtest.
+			t.Fatalf("FINDING stream: tool call %+v does not carry one JSON argument object", res.ToolCalls)
 		}
 		if res.Usage.Cost.Provenance != FromTable {
 			t.Errorf("FINDING stream unpriced: %+v", res.Usage.Cost)
@@ -525,18 +527,18 @@ func TestProbe_MessagesModelsListing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FINDING listing failed: %v", err)
 		}
-		var opus *ModelEntry
+		var entry *ModelEntry
 		for i := range entries {
 			if entries[i].ID == model {
-				opus = &entries[i]
+				entry = &entries[i]
 			}
 		}
 		t.Logf("listing: %d entries, warnings %v", len(entries), warnings)
-		if opus == nil {
+		if entry == nil {
 			t.Fatalf("FINDING %s not in the listing", model)
 		}
-		t.Logf("%s: max_input %d max_output %d raw %s", model, Tokens(opus.MaxInputTokens), Tokens(opus.MaxOutputTokens),
-			Truncate(string(opus.Raw), 400))
+		t.Logf("%s: max_input %d max_output %d raw %s", model, Tokens(entry.MaxInputTokens), Tokens(entry.MaxOutputTokens),
+			Truncate(string(entry.Raw), 400))
 	})
 }
 

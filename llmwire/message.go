@@ -252,7 +252,7 @@ func ReasoningBalanced() ReasoningRequest { return reasoningBalanced{} }
 // ReasoningDeep asks for the model's thorough setting, for a turn the user
 // chose to spend more time and tokens on: the profile's reasoning.deep level,
 // else reasoning.balanced, else the model's own default (nothing is sent).
-// Size the answer budget for it: thinking counts against the cap.
+// MaxAnswerTokens adds the level's reasoning.overhead, as for every intent.
 func ReasoningDeep() ReasoningRequest { return reasoningDeep{} }
 
 // ChatRequest is one completion request, before profile resolution.
