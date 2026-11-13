@@ -145,6 +145,10 @@ type Reasoning struct {
 	// shallow. Must be one of EffortValues, and never "none". Empty means the
 	// intent sends nothing and the model runs at its own default.
 	Balanced string `yaml:"balanced"`
+	// Deep is the level ReasoningDeep resolves to: the thorough setting a
+	// caller picks for a hard turn. Same rules as Balanced; empty falls back
+	// to Balanced.
+	Deep string `yaml:"deep"`
 	// Overhead is the reasoning tokens to budget beside a MaxAnswerTokens
 	// answer, per resolved level: an effort level, "off", or "default" for a
 	// request that sends no knob (DefaultEffort's entry wins there when both
@@ -544,7 +548,7 @@ func (p Profile) validateEmbeddings(bad func(string, ...any) error) error {
 	r := p.Reasoning
 	reasoningDeclared := r.Supported || r.EnabledByDefault || r.CanBeDisabled || r.Control != "" ||
 		len(r.EffortValues) > 0 || r.DefaultEffort != "" || r.StreamField != "" || r.BudgetParam != "" || r.LeaksCloseTag ||
-		r.Balanced != "" || len(r.Overhead) > 0 || r.MinBudget != 0
+		r.Balanced != "" || r.Deep != "" || len(r.Overhead) > 0 || r.MinBudget != 0
 	t := p.Tools
 	toolsDeclared := t.Supported || t.Format != "" || len(t.ToolChoiceValues) > 0 ||
 		t.SupportsForcedChoice || t.SupportsParallel || t.RecoverInlineMarkup
@@ -730,8 +734,8 @@ func (p Profile) validateChat(bad func(string, ...any) error) error {
 		return bad("min_budget is set but reasoning control is %q, which takes no budget", r.Control)
 	}
 	if !r.Supported {
-		if r.Balanced != "" || len(r.Overhead) > 0 {
-			return bad("reasoning is unsupported but balanced or overhead is set")
+		if r.Balanced != "" || r.Deep != "" || len(r.Overhead) > 0 {
+			return bad("reasoning is unsupported but balanced, deep or overhead is set")
 		}
 		if r.Control != "" && r.Control != ControlNone {
 			return bad("reasoning is unsupported but control is %q", r.Control)
@@ -791,6 +795,9 @@ func (p Profile) validateChat(bad func(string, ...any) error) error {
 		if r.Balanced != "" && (r.Balanced == "none" || !r.Accepts(r.Balanced)) {
 			return bad("balanced %q must be one of effort_values %v other than none; "+
 				"none is off, not balanced", r.Balanced, r.EffortValues)
+		}
+		if r.Deep != "" && (r.Deep == "none" || !r.Accepts(r.Deep)) {
+			return bad("deep %q must be one of effort_values %v other than none", r.Deep, r.EffortValues)
 		}
 		if err := r.checkOverhead(bad); err != nil {
 			return err

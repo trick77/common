@@ -170,24 +170,77 @@ func TestReasoningMinimal_BudgetModelWithoutAFloor(t *testing.T) {
 // The shipped profiles: the values a caller gets without naming a level.
 func TestReasoningIntents_ShippedProfiles(t *testing.T) {
 	c := testClient(t, Default())
-	for _, tc := range []struct{ model, minimal, balanced string }{
+	for _, tc := range []struct{ model, minimal, balanced, deep string }{
 		// Cannot be disabled (measured 400/1210): the lowest accepted level.
-		{"glm-5.3-flash", "low", "high"},
-		{"mimo-v2.6-pro", "off", "medium"},
-		{"mimo-v2.6-flash", "off", "medium"},
-		{"gpt-5.5", "off", "medium"},
+		{"glm-5.3-flash", "low", "high", "high"},
+		{"mimo-v2.6-pro", "off", "medium", "medium"},
+		{"mimo-v2.6-flash", "off", "medium", "medium"},
+		{"gpt-5.5", "off", "medium", "medium"},
 		// No none on the page: the floor is low.
-		{"gpt-6.1-sol", "low", "medium"},
+		{"gpt-6.1-sol", "low", "medium", "medium"},
+		// Always thinks: the floor is low.
+		{"claude-opus-5-5", "low", "medium", "high"},
+		{"claude-fable-5-2", "low", "medium", "high"},
 	} {
-		for intent, want := range map[string]string{"minimal": tc.minimal, "balanced": tc.balanced} {
+		for intent, want := range map[string]string{"minimal": tc.minimal, "balanced": tc.balanced, "deep": tc.deep} {
 			r := ReasoningMinimal()
-			if intent == "balanced" {
+			switch intent {
+			case "balanced":
 				r = ReasoningBalanced()
+			case "deep":
+				r = ReasoningDeep()
 			}
 			pl := mustPlan(t, c, ChatRequest{Model: tc.model, Messages: []Message{User("hi")}, Reasoning: r}, false)
 			if got := reasoningLabel(pl.req.Reasoning); got != want {
 				t.Errorf("%s %s: resolved to %q, want %q", tc.model, intent, got, want)
 			}
+		}
+	}
+}
+
+// ReasoningDeep takes the profile's deep level, falls back to balanced where
+// none is declared, and sends nothing where neither is.
+func TestReasoningDeep_Resolution(t *testing.T) {
+	reg := registryFrom(t, chatHead+
+		"    reasoning: {supported: true, enabled_by_default: true, control: effort, effort_values: [low, medium, high], balanced: medium, deep: high}\n")
+	c := testClient(t, reg)
+	pl := mustPlan(t, c, ChatRequest{Model: "m", Messages: []Message{User("hi")}, Reasoning: ReasoningDeep()}, false)
+	if got := reasoningLabel(pl.req.Reasoning); got != "high" {
+		t.Errorf("deep declared: resolved to %q, want high", got)
+	}
+
+	c = testClient(t, registryFrom(t, chatHead+
+		"    reasoning: {supported: true, enabled_by_default: true, control: effort, effort_values: [low, medium, high], balanced: medium}\n"))
+	pl = mustPlan(t, c, ChatRequest{Model: "m", Messages: []Message{User("hi")}, Reasoning: ReasoningDeep()}, false)
+	if got := reasoningLabel(pl.req.Reasoning); got != "medium" {
+		t.Errorf("no deep: resolved to %q, want balanced medium", got)
+	}
+
+	c = testClient(t, registryFrom(t, chatHead+
+		"    reasoning: {supported: true, enabled_by_default: true, control: effort, effort_values: [low, high]}\n"))
+	pl = mustPlan(t, c, ChatRequest{Model: "m", Messages: []Message{User("hi")}, Reasoning: ReasoningDeep()}, false)
+	if pl.req.Reasoning != nil {
+		t.Errorf("neither declared: resolved to %v, want nothing sent", pl.req.Reasoning)
+	}
+
+	c = testClient(t, registryFrom(t, chatHead+"    reasoning: {supported: false}\n"))
+	pl = mustPlan(t, c, ChatRequest{Model: "m", Messages: []Message{User("hi")}, Reasoning: ReasoningDeep()}, false)
+	if pl.req.Reasoning != nil {
+		t.Errorf("no reasoning: resolved to %v, want nothing sent", pl.req.Reasoning)
+	}
+}
+
+// deep is checked at load like balanced: a level the model does not take, or
+// none, is refused; so is deep on a model that does not reason.
+func TestReasoningDeep_ProfileValidation(t *testing.T) {
+	for name, reasoning := range map[string]string{
+		"unknown level": "{supported: true, enabled_by_default: true, control: effort, effort_values: [low, high], deep: max}",
+		"none":          "{supported: true, enabled_by_default: true, can_be_disabled: true, control: effort, effort_values: [none, low, high], deep: none}",
+		"unsupported":   "{supported: false, deep: high}",
+	} {
+		_, err := NewRegistry([]byte(chatHead + "    reasoning: " + reasoning + "\n"))
+		if err == nil || !strings.Contains(err.Error(), "deep") {
+			t.Errorf("%s: err = %v, want a refusal naming deep", name, err)
 		}
 	}
 }

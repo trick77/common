@@ -26,6 +26,7 @@ func TestRecordedReasoningMatchesReasoningSent(t *testing.T) {
 		{llmwiretest.ChatModel, llmwire.ReasoningEffort("high")},
 		{llmwiretest.ChatModel, llmwire.ReasoningMinimal()},
 		{llmwiretest.ChatModel, llmwire.ReasoningBalanced()},
+		{llmwiretest.ChatModel, llmwire.ReasoningDeep()},
 		{llmwiretest.BudgetModel, llmwire.ReasoningBudget(300)},
 		{llmwiretest.BudgetModel, llmwire.ReasoningBudget(0)},
 		{llmwiretest.BudgetModel, llmwire.ReasoningOff()},
@@ -96,6 +97,29 @@ func TestIntentsAreObservable(t *testing.T) {
 	}
 	if got, _ := last.MaxTokens(); got != answer+llmwiretest.BalancedOverhead {
 		t.Errorf("wire cap %d, want %d", got, answer+llmwiretest.BalancedOverhead)
+	}
+}
+
+// ReasoningDeep resolves to DeepSent and budgets DeepOverhead, on every
+// synthetic model that reasons by level.
+func TestDeepIntentIsObservable(t *testing.T) {
+	srv := llmwiretest.NewServer(t)
+	c := srv.Client()
+	answer := 1000
+	for _, model := range []string{llmwiretest.ChatModel, llmwiretest.ResponsesModel, llmwiretest.MessagesModel} {
+		resp, _, err := c.Chat(context.Background(), llmwire.ChatRequest{
+			Model: model, Messages: []llmwire.Message{llmwire.User("hi")},
+			Reasoning: llmwire.ReasoningDeep(), MaxAnswerTokens: &answer,
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", model, err)
+		}
+		if resp.ReasoningSent != llmwiretest.DeepSent {
+			t.Errorf("%s: reasoning sent %q, want %q", model, resp.ReasoningSent, llmwiretest.DeepSent)
+		}
+		if got, _ := srv.Last().MaxTokens(); got != answer+llmwiretest.DeepOverhead {
+			t.Errorf("%s: wire cap %d, want %d", model, got, answer+llmwiretest.DeepOverhead)
+		}
 	}
 }
 

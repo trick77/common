@@ -29,6 +29,7 @@ func TestPlan_CapParamComesFromTheProfile(t *testing.T) {
 		{"glm-5.3-flash", ParamMaxTokens},
 		{"mimo-v2.6-pro", ParamMaxCompletionTokens},
 		{"mimo-v2.6-flash", ParamMaxCompletionTokens},
+		{"claude-fable-5-2", ParamMaxTokens},
 	} {
 		pl := mustPlan(t, c, ChatRequest{
 			Model:    tc.model,

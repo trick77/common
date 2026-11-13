@@ -1098,6 +1098,9 @@ profiles:
       default_effort: medium
       # NOT measured, a choice: the documented default.
       balanced: medium
+      # NOT measured, a choice: the vendor's level for hard and agentic
+      # work, one above balanced. ReasoningDeep resolves to it.
+      deep: high
       # overhead ABSENT, and DefaultReasoningOverhead (1024) is far short at
       # high and above: MEASURED, a counting problem at high thought through
       # the whole 16000-token cap and returned no answer.
@@ -1180,3 +1183,117 @@ profiles:
       thinking blocks go back each round. No forced tool choice, no
       temperature or top_p, no json_object. Caching is opt-in through
       ExtraBody cache_control. messages.go head comment.
+
+  # ---------------------------------------------------------------------------
+  # Anthropic, its own API. Sources: the claude-api skill reference for
+  # claude-fable-5-2 (cached 2026-11-03) and the models listing. MEASURED
+  # 2026-11-13 on api.anthropic.com, the Messages* probes' claude-fable-5-2
+  # subtests (eval_messages_test.go, FINDINGS.md).
+  # ---------------------------------------------------------------------------
+  - id: claude-fable-5-2
+    display_name: Claude Fable 5.2
+    endpoint: chat
+    wire_api: messages
+    wire_model_id: claude-fable-5-2
+    provider: anthropic
+    verified: measured
+
+    # MEASURED: max_tokens honoured (StreamFrames stopped on max_tokens at
+    # 4000).
+    max_tokens_param: max_tokens
+
+    # MEASURED: low, medium, high, xhigh and max accepted; none and minimal a
+    # 400 ("output_config.effort: Input should be 'low', 'medium', 'high',
+    # 'xhigh' or 'max'"); thinking.type disabled and enabled both a 400, as on
+    # Opus. ReasoningMinimal resolves to low.
+    reasoning:
+      supported: true
+      enabled_by_default: true
+      can_be_disabled: false
+      control: effort
+      effort_values: [low, medium, high, xhigh, max]
+      # NOT measured, skill reference: high is the default, one above Opus 5.5.
+      default_effort: high
+      # NOT measured, a choice: the vendor's level for everyday knowledge work.
+      balanced: medium
+      # NOT measured, a choice: the vendor's starting point for hard work;
+      # gains above it are uneven.
+      deep: high
+      # overhead ABSENT. At high, three chat prompts thought 37-124 tokens
+      # (two runs), but the StreamFrames counting problem spent its whole 4000
+      # cap thinking, and the same prompt uncapped ran past a 5-minute call
+      # cap. A fixed figure covers neither end; DefaultReasoningOverhead
+      # applies.
+
+    # MEASURED: temperature and top_p each a 400, "Extra inputs are not
+    # permitted".
+    temperature:
+      supported: false
+    top_p:
+      supported: false
+
+    # MEASURED: tool_choice any and tool a 400, "tool_choice: type \"tool\"
+    # and \"any\" are not supported for this model." The tool loop replaying
+    # resp.Assistant() and a hand-built turn with no thinking block were both
+    # accepted, streamed too. Parallel calls NOT measured.
+    tools:
+      supported: true
+      format: native
+      tool_choice_values: [auto, none]
+      supports_forced_choice: false
+      supports_parallel: true
+
+    # MEASURED: output_config.format json_schema, the reply parsed.
+    output:
+      json_object: false
+      json_schema: true
+      strict_schema: true
+
+    # MEASURED: usage on message_start and message_delta unasked. A 4000-token
+    # think streamed 425 thinking_delta frames in 40s, the longest gap 4.8s,
+    # one ping.
+    streaming:
+      supported: true
+      needs_include_usage: false
+      accepts_stream_options: false
+
+    # MEASURED, the models listing: max_input_tokens 1000000, max_tokens 128000.
+    limits:
+      context: 1000000
+      max_output: 128000
+
+    # NOT measured, models listing and skill reference.
+    vision: true
+
+    # MEASURED: a request ending on an assistant turn is a 400, "This model
+    # does not support assistant message prefill. The conversation must end
+    # with a user message."
+    assistant_prefill: false
+
+    # Skill reference 2026-11-03: base input 8, 5-minute cache write 10
+    # (1.25x), 1-hour cache write 16, cache read 0.20 (0.025x), output 40. No
+    # long-context tier. MEASURED containment: cache lanes beside
+    # input_tokens, 11215 written then read, as on Opus.
+    cost:
+      input: 8.00
+      cache_read: 0.20
+      cache_write: 10.00
+      output: 40.00
+      source_url: https://platform.claude.com/docs/en/about-claude/pricing
+      verified_on: 2026-11-13
+
+    finish_reasons_extra: [content_filter, pause_turn, model_context_window_exceeded]
+
+    notes: >-
+      Speaks Anthropic's Messages protocol. A Covered Model: an organization
+      or workspace without 30-day data retention gets a 400 on every request.
+      Always thinks, high by default; at high a hard prompt can think for
+      minutes and fill any cap. The history-editing check runs on every
+      account, MEASURED: a signed thinking block replayed after an edit to
+      system is a 400 ("The block is bound to a different conversation"),
+      while the same turn rebuilt without its thinking block is accepted. So
+      a tool loop appends resp.Assistant() and only appends; a caller that
+      rewrites the history sends the rebuilt turns, no ResponseItems. It
+      reads earlier models' thinking; no earlier model reads its. A refusal
+      is content_filter. No forced tool choice, no temperature or top_p, no
+      json_object.

@@ -104,6 +104,9 @@ var evalRates = map[string]evalRate{
 	// write at 8.00 (base input 4.00); output 20.00. Fast mode (2x) is
 	// refused in plan, so its 40.00 is not a lane a probe reaches.
 	"claude-opus-5-5": {8.00, 20.00},
+	// Skill reference 2026-11-03: the dearest input lane is the one-hour
+	// cache write at 16.00 (base input 8.00); output 40.00.
+	"claude-fable-5-2": {16.00, 40.00},
 }
 
 // meter accumulates spend across the whole run. Shared by every probe, because

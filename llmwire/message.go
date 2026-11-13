@@ -223,7 +223,7 @@ func ReasoningEffort(level string) ReasoningRequest { return reasoningEffort{lev
 // ReasoningBudget asks for a token budget.
 func ReasoningBudget(tokens int) ReasoningRequest { return reasoningBudget{tokens: tokens} }
 
-// The two intents. A caller that names a level binds itself to one model's
+// The three intents. A caller that names a level binds itself to one model's
 // vocabulary: "low" is the floor on glm-5.3-flash and a middle rung on gpt-5.x,
 // and "none" is refused outright by the first. An intent is resolved against the
 // profile per request, into one of the three concrete variants above, and from
@@ -231,9 +231,11 @@ func ReasoningBudget(tokens int) ReasoningRequest { return reasoningBudget{token
 // What it became is on ChatResponse.ReasoningSent and StreamResult.ReasoningSent.
 type reasoningMinimal struct{}
 type reasoningBalanced struct{}
+type reasoningDeep struct{}
 
 func (reasoningMinimal) isReasoning()  {}
 func (reasoningBalanced) isReasoning() {}
+func (reasoningDeep) isReasoning()     {}
 
 // ReasoningMinimal asks for the shallowest thinking the model has: off where the
 // profile says it can be disabled, else the first (shallowest) of its
@@ -246,6 +248,12 @@ func ReasoningMinimal() ReasoningRequest { return reasoningMinimal{} }
 // reasoning.balanced level where one is declared, else the model's own default
 // (nothing is sent).
 func ReasoningBalanced() ReasoningRequest { return reasoningBalanced{} }
+
+// ReasoningDeep asks for the model's thorough setting, for a turn the user
+// chose to spend more time and tokens on: the profile's reasoning.deep level,
+// else reasoning.balanced, else the model's own default (nothing is sent).
+// Size the answer budget for it: thinking counts against the cap.
+func ReasoningDeep() ReasoningRequest { return reasoningDeep{} }
 
 // ChatRequest is one completion request, before profile resolution.
 //
